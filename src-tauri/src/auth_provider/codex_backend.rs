@@ -123,10 +123,28 @@ impl CodexProvider {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
+        headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(CODEX_USER_AGENT),
+        );
+        headers.insert(
+            header::HeaderName::from_static("originator"),
+            header::HeaderValue::from_static(CODEX_ORIGINATOR),
+        );
+        headers.insert(
+            header::HeaderName::from_static("chatgpt-account-id"),
+            header::HeaderValue::from_str(&account.account_id)
+                .map_err(|_| ProviderError::InvalidPayload)?,
+        );
 
         // Only a small non-auth whitelist survives the account boundary.  In
         // particular caller Authorization and x-openai-actor-authorization are
-        // never relayed to a subscription account.
+        // never relayed to a subscription account. Accept/User-Agent may
+        // override the defaults for JSON-only probes such as model listing.
         for name in [header::ACCEPT, header::USER_AGENT] {
             if let Some(value) = caller_headers.get(&name) {
                 headers.insert(name, value.clone());
@@ -226,15 +244,6 @@ impl Provider for CodexProvider {
         headers.insert(
             header::USER_AGENT,
             header::HeaderValue::from_static(CODEX_USER_AGENT),
-        );
-        headers.insert(
-            header::HeaderName::from_static("originator"),
-            header::HeaderValue::from_static(CODEX_ORIGINATOR),
-        );
-        headers.insert(
-            header::HeaderName::from_static("chatgpt-account-id"),
-            header::HeaderValue::from_str(&account.account_id)
-                .map_err(|_| ProviderError::InvalidPayload)?,
         );
         let response = self
             .client
