@@ -517,6 +517,9 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "auth_refresh_token" => {
             to_json(commands::auth::auth_refresh_token(arg(&args, "id")?, state).await)
         }
+        "auth_refresh_quota" => {
+            to_json(commands::auth::auth_refresh_quota(arg(&args, "id")?, state).await)
+        }
         "auth_sync_models" => {
             to_json(commands::auth::auth_sync_models(arg(&args, "id")?, state).await)
         }

@@ -268,6 +268,7 @@ pub fn run() {
             commands::auth::auth_default_import_path,
             commands::auth::auth_logout,
             commands::auth::auth_refresh_token,
+            commands::auth::auth_refresh_quota,
             commands::auth::auth_sync_models,
             commands::auth::auth_export_json,
             commands::auth::auth_export_json_content,

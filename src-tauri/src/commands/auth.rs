@@ -884,6 +884,20 @@ pub async fn auth_refresh_token(
 }
 
 #[tauri::command]
+pub async fn auth_refresh_quota(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<AuthAccountDto, String> {
+    validate_account_id(&id)?;
+    state
+        .auth_service
+        .refresh_quota(&id)
+        .await
+        .map_err(safe_error)
+        .and_then(|summary| AuthAccountDto::try_from(summary).map_err(safe_error))
+}
+
+#[tauri::command]
 pub async fn auth_sync_models(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
