@@ -1078,6 +1078,7 @@ pub(crate) async fn route_stream_plan_with_auth_service(
 
 /// Bounded, single-line preview of raw upstream bytes for diagnostics.
 const FIRST_RECORD_SNIPPET_BYTES: usize = 240;
+const MAX_FIRST_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 fn upstream_snippet(bytes: &[u8], max_bytes: usize) -> String {
     let truncated = if bytes.len() > max_bytes {
@@ -1123,7 +1124,7 @@ async fn buffer_first_record(
     };
     loop {
         // Bound the first-frame buffer (a malicious upstream must not OOM us).
-        if buffer.len() > 256 * 1024 {
+        if buffer.len() > MAX_FIRST_RECORD_BYTES {
             return Err(format!(
                 "received {} bytes with no SSE record terminator{ct_note}; preview: \"{}\"",
                 buffer.len(),
@@ -1783,6 +1784,34 @@ mod tests {
         let diagnostic = buffer_first_record(&mut upstream).await.unwrap_err();
         assert!(diagnostic.contains("failed validation"), "{diagnostic}");
         assert!(diagnostic.contains("not valid json"), "{diagnostic}");
+    }
+
+    /// ChatGPT Codex can emit a very large first `response.created` event
+    /// because the response object echoes request metadata/tools.  The commit
+    /// barrier must wait for the real SSE terminator instead of treating a
+    /// >256 KiB but otherwise valid first record as a protocol failure.
+    #[tokio::test]
+    async fn buffer_first_record_accepts_large_codex_created_event() {
+        let large_metadata = "x".repeat(300 * 1024);
+        let record = format!(
+            "event: response.created\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_test",
+                    "object": "response",
+                    "status": "in_progress",
+                    "metadata": { "large": large_metadata }
+                },
+                "sequence_number": 0
+            })
+        );
+        let mut upstream = upstream_from_chunks(vec![record.as_bytes()]);
+
+        let (first_frame, carry) = buffer_first_record(&mut upstream).await.unwrap();
+
+        assert_eq!(first_frame, record.as_bytes());
+        assert!(carry.is_empty());
     }
 
     /// Non-SSE content-type must be called out in the diagnostic.
