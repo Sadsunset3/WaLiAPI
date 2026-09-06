@@ -1,5 +1,6 @@
 import { Clock3 } from "lucide-react";
 import type { AuthQuotaLimit, AuthQuotaWindow } from "../../types";
+import { quotaDisplayState } from "./quotaDisplay";
 
 // `window_minutes` is in minutes: 5h = 300, 7d = 10080, 30d = 43200.
 const MINUTES_5H = 5 * 60;
@@ -42,18 +43,18 @@ function windowLabel(window: AuthQuotaWindow) {
 }
 
 function QuotaWindow({ limit, window }: { limit: AuthQuotaLimit; window: AuthQuotaWindow }) {
-  const used = Math.max(0, Math.min(100, window.used_percent ?? 0));
-  const exhausted = used >= 100;
-  const barColor = exhausted ? "bg-destructive" : used >= 70 ? "bg-warning" : "bg-success";
+  const { remaining, tone } = quotaDisplayState(window.used_percent);
+  const exhausted = tone === "destructive";
+  const barColor = tone === "destructive" ? "bg-destructive" : tone === "warning" ? "bg-warning" : "bg-success";
   const reset = resetLabel(window.reset_at);
   return (
     <div className="rounded-xl border border-border bg-muted/45 p-3">
       <div className="flex items-center justify-between gap-3 text-xs">
         <span className="flex items-center gap-1.5 font-medium"><Clock3 size={13} className="text-muted-foreground" />限额 · {limit.limit_name || windowLabel(window)}</span>
-        <span className={exhausted ? "font-semibold text-destructive" : "font-semibold text-muted-foreground"}>{used.toFixed(0)}% 已用</span>
+        <span className={exhausted ? "font-semibold text-destructive" : "font-semibold text-muted-foreground"}>{remaining == null ? "剩余 --" : `剩余 ${remaining.toFixed(0)}%`}</span>
       </div>
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-card">
-        <div className={`h-full rounded-full ${barColor}`} style={{ width: `${used}%` }} />
+        <div className={`h-full rounded-full ${barColor}`} style={{ width: `${remaining ?? 0}%` }} />
       </div>
       {reset && <p className="mt-2 text-[11px] text-muted-foreground">重置 {reset} · {limit.limit_id}</p>}
     </div>
