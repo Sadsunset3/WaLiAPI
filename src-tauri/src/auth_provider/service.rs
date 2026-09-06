@@ -353,31 +353,72 @@ impl AuthService {
         AuthAccountSummary::from_account(&account)
     }
 
-    /// Probe the provider's dedicated quota endpoint and persist the result.
-    /// Failures are silent and preserve whatever quota was previously stored —
-    /// a quota probe never turns a successful account operation into an error,
-    /// and never wipes known quota when the probe is unavailable.
+    /// Strict quota refresh used by an explicit user action.  Capability is
+    /// checked before any provider lookup or request.  A due credential is
+    /// refreshed without its usual quota probe, ensuring this path calls the
+    /// dedicated quota endpoint exactly once.  Persistence happens only after
+    /// a valid quota state has been returned, so all failures preserve cache.
+    pub async fn refresh_quota(
+        &self,
+        account_id: &str,
+    ) -> Result<AuthAccountSummary, ProviderError> {
+        let account = self.get_account(account_id).await?;
+        let supports_quota = crate::auth_provider::spec::provider_spec_by_name(&account.provider)
+            .is_some_and(|spec| spec.supports_quota);
+        if !supports_quota {
+            return Err(ProviderError::UnsupportedFeatures {
+                pointer: "/quota".into(),
+            });
+        }
+
+        self.refresh_with_lock(
+            account_id,
+            self.clock.now() + Duration::minutes(5),
+            false,
+            false,
+        )
+        .await?;
+
+        self.probe_quota(account_id).await
+    }
+
+    async fn probe_quota(&self, account_id: &str) -> Result<AuthAccountSummary, ProviderError> {
+        let account = self.get_account(account_id).await?;
+        let supports_quota = crate::auth_provider::spec::provider_spec_by_name(&account.provider)
+            .is_some_and(|spec| spec.supports_quota);
+        if !supports_quota {
+            return Err(ProviderError::UnsupportedFeatures {
+                pointer: "/quota".into(),
+            });
+        }
+        let payload = Self::payload_for(&account)?;
+        let provider = self.registry.provider_for_name(&account.provider)?;
+        let quota = provider
+            .fetch_quota(&account, &payload)
+            .await?
+            .ok_or(ProviderError::Protocol)?;
+        self.repository
+            .update_quota(account_id, Some(&quota))
+            .await
+            .map_err(|_| ProviderError::Storage)?;
+
+        let account = self.get_account(account_id).await?;
+        AuthAccountSummary::from_account(&account)
+    }
+
+    /// Best-effort quota synchronization for login, model sync and scheduled
+    /// maintenance.  Failures remain silent and preserve the last cached quota.
     pub async fn sync_quota(&self, account_id: &str) {
         let Ok(account) = self.get_account(account_id).await else {
             return;
         };
-        if account.provider != "codex" {
+        let supports_quota = crate::auth_provider::spec::provider_spec_by_name(&account.provider)
+            .is_some_and(|spec| spec.supports_quota);
+        if !supports_quota {
             return;
         }
-        let Ok(payload) = Self::payload_for(&account) else {
-            return;
-        };
-        let Ok(provider) = self.registry.provider_for_name(&account.provider) else {
-            return;
-        };
-        let Ok(Some(quota)) = provider.fetch_quota(&account, &payload).await else {
-            return;
-        };
-        if let Err(error) = self.repository.update_quota(account_id, Some(&quota)).await {
-            tracing::warn!(
-                account_id,
-                "failed to persist auth account quota state: {error}"
-            );
+        if let Err(error) = self.probe_quota(account_id).await {
+            tracing::warn!(account_id, %error, "failed to refresh auth account quota state");
         }
     }
 
@@ -669,6 +710,7 @@ mod tests {
         models_fail: bool,
         refresh_fails: bool,
         quota_fail: bool,
+        quota_missing: bool,
     }
     #[async_trait]
     impl Provider for FakeProvider {
@@ -730,6 +772,9 @@ mod tests {
             self.quota_hits.fetch_add(1, Ordering::SeqCst);
             if self.quota_fail {
                 return Err(ProviderError::Retryable);
+            }
+            if self.quota_missing {
+                return Ok(None);
             }
             Ok(Some(QuotaState {
                 version: 1,
@@ -876,6 +921,7 @@ mod tests {
             models_fail: false,
             refresh_fails: false,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -912,6 +958,7 @@ mod tests {
             models_fail: false,
             refresh_fails: false,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -936,6 +983,7 @@ mod tests {
             models_fail: false,
             refresh_fails: false,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -989,6 +1037,7 @@ mod tests {
             models_fail: false,
             refresh_fails: false,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -1039,6 +1088,7 @@ mod tests {
             models_fail: true,
             refresh_fails: false,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake);
@@ -1063,6 +1113,7 @@ mod tests {
             models_fail: false,
             refresh_fails: false,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake);
@@ -1103,6 +1154,7 @@ mod tests {
             models_fail: false,
             refresh_fails: false,
             quota_fail: true,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake);
@@ -1119,6 +1171,249 @@ mod tests {
             quota.next_recover_at.as_deref(),
             Some("2026-08-10T00:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_quota_refreshes_due_token_then_probes_once_and_returns_persisted_state() {
+        // Mutation caught: probing with a stale token, or probing both during
+        // token refresh and again during the explicit quota refresh.
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: false,
+            quota_missing: false,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake.clone());
+        let service = AuthService::with_clock(
+            repository.clone(),
+            registry,
+            Arc::new(FixedClock("2026-08-09T00:00:00Z".parse().unwrap())),
+        );
+
+        let summary = service.refresh_quota(&account.id).await.unwrap();
+
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.quota_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.operations.load(Ordering::SeqCst), 2);
+        assert_eq!(summary.expires_at.as_deref(), Some("2026-08-09T02:00:00Z"));
+        let returned = summary.quota.unwrap();
+        assert_eq!(
+            returned.limits[0].primary.as_ref().unwrap().used_percent,
+            Some(25.0)
+        );
+        assert_eq!(
+            repository
+                .get_auth_account(&account.id)
+                .await
+                .unwrap()
+                .quota_state()
+                .unwrap()
+                .unwrap(),
+            returned
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_quota_with_fresh_token_skips_token_refresh_and_probes_once() {
+        // Mutation caught: forcing token rotation for every explicit quota
+        // refresh instead of honoring the five-minute lazy-refresh threshold.
+        let repository = repository().await;
+        let account = repository
+            .upsert_by_provider_account_id(&AuthAccountUpsert {
+                provider: "codex".into(),
+                label: "Fresh fixture".into(),
+                account_id: "account-fresh".into(),
+                attributes: json!({}),
+                payload: json!({
+                    "access_token": ACCESS,
+                    "refresh_token": REFRESH,
+                    "id_token": ID,
+                    "expires_at": "2026-08-09T00:06:00Z"
+                }),
+                last_refreshed_at: None,
+                next_refresh_after: None,
+                next_retry_after: None,
+            })
+            .await
+            .unwrap();
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: false,
+            quota_missing: false,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake.clone());
+        let service = AuthService::with_clock(
+            repository.clone(),
+            registry,
+            Arc::new(FixedClock("2026-08-09T00:00:00Z".parse().unwrap())),
+        );
+
+        let summary = service.refresh_quota(&account.id).await.unwrap();
+
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.quota_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.operations.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.quota.unwrap().limits.len(), 1);
+        assert!(repository
+            .get_auth_account(&account.id)
+            .await
+            .unwrap()
+            .quota_state()
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_quota_returns_error_and_preserves_existing_quota_on_probe_failure() {
+        // Mutation caught: clearing or replacing cached quota before a failed
+        // upstream request has produced a valid new value.
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let existing = QuotaState {
+            version: 1,
+            exceeded: true,
+            reason: Some("cached".into()),
+            next_recover_at: Some("2026-08-10T00:00:00Z".into()),
+            backoff_level: 3,
+            limits: vec![],
+        };
+        repository
+            .update_quota(&account.id, Some(&existing))
+            .await
+            .unwrap();
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: true,
+            quota_missing: false,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake);
+        let service = AuthService::with_clock(
+            repository.clone(),
+            registry,
+            Arc::new(FixedClock("2026-08-08T00:00:00Z".parse().unwrap())),
+        );
+
+        assert_eq!(
+            service.refresh_quota(&account.id).await.unwrap_err(),
+            ProviderError::Retryable
+        );
+        assert_eq!(
+            repository
+                .get_auth_account(&account.id)
+                .await
+                .unwrap()
+                .quota_state()
+                .unwrap()
+                .unwrap(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_quota_rejects_missing_rate_limit_and_preserves_existing_quota() {
+        // Mutation caught: treating a successful HTTP response without a
+        // usable rate_limit as a successful refresh that wipes old state.
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let existing = QuotaState {
+            version: 1,
+            exceeded: false,
+            reason: Some("cached".into()),
+            next_recover_at: None,
+            backoff_level: 1,
+            limits: vec![],
+        };
+        repository
+            .update_quota(&account.id, Some(&existing))
+            .await
+            .unwrap();
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: false,
+            quota_missing: true,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake);
+        let service = AuthService::with_clock(
+            repository.clone(),
+            registry,
+            Arc::new(FixedClock("2026-08-08T00:00:00Z".parse().unwrap())),
+        );
+
+        assert_eq!(
+            service.refresh_quota(&account.id).await.unwrap_err(),
+            ProviderError::Protocol
+        );
+        assert_eq!(
+            repository
+                .get_auth_account(&account.id)
+                .await
+                .unwrap()
+                .quota_state()
+                .unwrap()
+                .unwrap(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_quota_rejects_provider_without_quota_before_network() {
+        // Mutation caught: looking up or calling an upstream provider before
+        // enforcing the renderer-safe quota capability gate.
+        let repository = repository().await;
+        let account = repository
+            .upsert_by_provider_account_id(&AuthAccountUpsert {
+                provider: "kimi".into(),
+                label: "Kimi".into(),
+                account_id: "kimi-1".into(),
+                attributes: json!({}),
+                payload: json!({}),
+                last_refreshed_at: None,
+                next_refresh_after: None,
+                next_retry_after: None,
+            })
+            .await
+            .unwrap();
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: false,
+            quota_missing: false,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake.clone());
+        let service = AuthService::new(repository, registry);
+
+        assert_eq!(
+            service.refresh_quota(&account.id).await.unwrap_err(),
+            ProviderError::UnsupportedFeatures {
+                pointer: "/quota".into()
+            }
+        );
+        assert_eq!(fake.operations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1150,6 +1445,7 @@ mod tests {
             models_fail: false,
             refresh_fails: true,
             quota_fail: false,
+            quota_missing: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
