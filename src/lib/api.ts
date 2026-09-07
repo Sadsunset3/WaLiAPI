@@ -132,6 +132,7 @@ export const authApi = {
   defaultImportPath: () => invoke<string>("auth_default_import_path"),
   logout: (id: string) => invoke<AuthLogoutResult>("auth_logout", { id }),
   refreshToken: (id: string) => invoke<AuthAccount>("auth_refresh_token", { id }),
+  refreshQuota: (id: string) => invoke<AuthAccount>("auth_refresh_quota", { id }),
   syncModels: (id: string) => invoke<AuthAccount>("auth_sync_models", { id }),
   exportJson: (id: string, path: string) => invoke<AuthExportResult>("auth_export_json", { id, path }),
   /** Web 版：导出 auth.json 内容，由浏览器触发下载。 */
