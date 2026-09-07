@@ -133,13 +133,18 @@ export function UsagePage() {
   const [keyValue, setKeyValue] = useState("");
   const [keyValueLoading, setKeyValueLoading] = useState(false);
   useEffect(() => { setKeyValue(""); }, [selKey]);
-  const loadKeyValue = async () => {
-    if (!selKey || keyValue || keyValueLoading) return;
+  const loadKeyValue = async (): Promise<string> => {
+    if (!selKey) return "";
+    if (keyValue) return keyValue;
+    if (keyValueLoading) return "";
     setKeyValueLoading(true);
     try {
-      setKeyValue(await apiKeyApi.getFull(selKey));
+      const full = await apiKeyApi.getFull(selKey);
+      setKeyValue(full);
+      return full;
     } catch (e) {
       console.error("Failed to load full key:", e);
+      return "";
     } finally {
       setKeyValueLoading(false);
     }
@@ -411,15 +416,25 @@ public class AnthropicTest {
     setTestState("running"); setTestResult(""); setTestLatency(null);
     const startTime = performance.now();
     try {
+      // FIX：测试请求头必须用真实密钥。占位文案含中文全角括号，塞进 header 会触发
+      // 浏览器 "String contains non ISO-8859-1 code point" 直接抛错；未载入时先取回。
+      let realKey = keyValue;
+      if (!realKey) realKey = await loadKeyValue();
+      if (!realKey) {
+        setTestState("error");
+        setTestResult("未能载入完整密钥：请先在左侧点击「载入密钥」，确认密钥有效后再测试。");
+        return;
+      }
+
       const isAnthropic = activeProtocol === "anthropic";
       const isResponses = activeProtocol === "responses";
       const url = endpoints[activeProtocol];
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (isAnthropic) {
-        headers["x-api-key"] = selKey;
+        headers["x-api-key"] = realKey;
         headers["anthropic-version"] = "2023-06-01";
       } else {
-        headers["Authorization"] = `Bearer ${keyForSamples}`;
+        headers["Authorization"] = `Bearer ${realKey}`;
       }
       let body: string;
       if (isAnthropic) {
@@ -629,8 +644,8 @@ public class AnthropicTest {
                 {/* FIX-13：按需载入完整密钥后才能复制/生成真实示例 */}
                 <button
                   onClick={async () => {
-                    await loadKeyValue();
-                    if (keyValue) { await copy(keyValue, "key"); }
+                    const full = await loadKeyValue();
+                    if (full) { await copy(full, "key"); }
                   }}
                   disabled={!selKey}
                   className="action-secondary px-3 py-2.5 disabled:opacity-50"
