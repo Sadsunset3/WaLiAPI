@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.2.8-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.2.9-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-使用方式)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -40,18 +40,20 @@
 
 | | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
 |:---:|:---|:---|:---:|:---|:---|
-| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 297 | `+79,716 / -16,208` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server · Codex 账号切换 |
+| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 315 | `+95,134 / -16,763` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server · Codex 账号切换 |
 | ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 140 | `+97,192 / -24,477` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 · Kimi Code Auth · protocol 模块结构化重构 · Auth 多格式导入 |
+| 🛠 | **chyuan** | [@chyuan-cuihongyuan](https://github.com/chyuan-cuihongyuan) | 33 | `+5,661 / -1,477` | 统一上游重试判定决策函数与真值表测试 · 401/403 下游脱敏 · 上游终态错误短路 · 数据库故障误报修复 · Anthropic 内置工具 400 修复 |
 | 🐳 | **Fla1337** | [@Fla1337](https://github.com/Fla1337) | 15 | `+4,978 / -1,143` | Web 管理面板 · Docker / headless 部署 · waliapi-web 二进制 · 多阶段镜像构建 · Web 管理面板用户设置 |
-| 🔧 | **Nelson** | [@Zhengmingming1](https://github.com/Zhengmingming1) | 4 | `+3,086 / -120` | 知识库扫描版 PDF VLM OCR（方案A）· OCR 页级混合识别 · 修复 Claude 渠道协议适配 · OCR/Embedding 模型下拉按用途过滤 · pdfium macOS 打包路径修复 |
 | 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 10 | `+1,228 / -244` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
-| 🛠 | **chyuan** | [@chyuan-cuihongyuan](https://github.com/chyuan-cuihongyuan) | 5 | `+524 / -103` | 统一上游重试判定决策函数与真值表测试 · 401/403 下游脱敏 · 上游终态错误短路 · 数据库故障误报修复 · Anthropic 内置工具 400 修复 |
-| 🐛 | **Jason** | [@freakojc](https://github.com/freakojc) | 3 | `+1,708 / -32` | 流式日志 499 误记修复 + Token 用量恢复（PR #62）· 仪表盘 cached_tokens 聚合覆盖索引消除 2 秒加载（PR #63）|
+| 🔧 | **Nelson** | [@Zhengmingming1](https://github.com/Zhengmingming1) | 4 | `+3,086 / -120` | 知识库扫描版 PDF VLM OCR（方案A）· OCR 页级混合识别 · 修复 Claude 渠道协议适配 · OCR/Embedding 模型下拉按用途过滤 · pdfium macOS 打包路径修复 |
 | 🐞 | **xerina** | [@jiangnuonnuo](https://github.com/jiangnuonnuo) | 4 | `+257 / -82` | Wiki Unicode 文本切片 panic 进程崩溃修复 · 新增字符边界安全切片工具（utils/text.rs）· RAG/Wiki 设置保存后状态未即时更新修复（PR #60）|
-| 🔧 | **cham** | [@Cham1229](https://github.com/Cham1229) | 1 | `+444 / -111` | 自定义安全规则接入运行时安全扫描管道——规则加载·白名单短路·黑名单匹配·端到端集成测试（PR #64）|
+| 🐛 | **Jason** | [@freakojc](https://github.com/freakojc) | 3 | `+1,708 / -32` | 流式日志 499 误记修复 + Token 用量恢复（PR #62）· 仪表盘 cached_tokens 聚合覆盖索引消除 2 秒加载（PR #63）|
+| 🔧 | **yuanqixun** | [@yuanqixun](https://github.com/yuanqixun) | 3 | `+437 / -39` | Codex 剩余额度展示 · 手动刷新 Codex 额度 · 大响应 SSE 帧兼容修复 |
 | 🐛 | **cyd** | [@cydmacro](https://github.com/cydmacro) | 2 | `+105 / -9` | Codex 工具调用参数一次性下发，修复部分客户端截断 · Codex Responses 请求 strip `prompt_cache_options` 兼容修复（PR #59）|
-| 🐛 | **breezewonders** | [@breezewonders-dev](https://github.com/breezewonders-dev) | 1 | `+14 / -0` | Chat-to-Responses 转换 store 字段归一化修复 |
+| 🔧 | **cham** | [@Cham1229](https://github.com/Cham1229) | 1 | `+444 / -111` | 自定义安全规则接入运行时安全扫描管道——规则加载·白名单短路·黑名单匹配·端到端集成测试（PR #64）|
 | 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
+| 🐛 | **zjx** | `—` | 1 | `+22 / -7` | Usage 连接测试请求头改为非中文占位密钥，避免无效请求头写入 |
+| 🐛 | **breezewonders** | [@breezewonders-dev](https://github.com/breezewonders-dev) | 1 | `+14 / -0` | Chat-to-Responses 转换 store 字段归一化修复 |
 
 </div>
 
@@ -652,6 +654,26 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 ---
 
 ## 📌 版本历史
+
+### v0.2.9 (2026-09-07)
+
+#### Codex 账号与额度
+
+- ✨ **Auth 账号额度改为剩余展示**：Auth 渠道卡片从“已用额度”切换为“剩余额度”视角，并补上前端展示工具与测试，用户能更直观看到当前还能使用多少额度（PR #67）
+- ✨ **支持主动刷新 Codex 额度**：新增手动刷新 Codex 配额能力，前后端都接入刷新入口，Auth 渠道页可直接触发额度同步，减少等待后台轮询的时间（PR #68）
+- 🐛 **修复 Codex 大响应 SSE 帧异常**：放宽大体积 `response.created` 事件的处理，避免 Codex 大响应场景因 SSE 帧创建阶段异常导致 502 或流式中断（PR #66）
+
+#### 全量审计修复合流
+
+- 🔒 **合入 v0.2.7→v0.2.8 全量审计修复**：当前 `v0.2.9` 分支已并入 PR #70，包含 KB/Wiki/MCP 端点鉴权恢复、KB 上传与导入边界收紧、URL SSRF 防护、管理面认证加固、API Key 掩码展示与按需取全量等修复
+- 🔧 **核心稳定性与安全扫描补强**：同步并入流式首帧/空闲超时、流式落账修复、多 Key 加权选择边界修正、404 故障切换语义统一、原生 Anthropic 路径落账对齐，以及响应侧安全扫描接入全部转发路径
+- 🖥️ **管理端体验与运维诊断增强**：全局 ErrorBoundary、日志安全解析、Wiki 渲染 sanitize、会话过期统一跳登录、日志页与知识库页竞态治理，以及 `/health` 版本号与日志目录等可观测性增强均已随 PR #70 合流
+
+#### 其他
+
+- 🐛 **Usage 连接测试请求头兼容性修复**：连接测试不再写入中文占位密钥，改为 ASCII 安全占位值，避免无效请求头被浏览器或运行时拒绝（PR #71）
+- 📝 **README 贡献者数据同步**：新增 2 位贡献者 yuanqixun 和 zjx，并按最新提交记录更新全体贡献者提交数与代码变更统计
+- 🔧 **版本号统一升级至 0.2.9**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
 ### v0.2.8 (2026-09-03)
 

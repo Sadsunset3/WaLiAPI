@@ -331,8 +331,8 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
   const activeChannels = channels.filter(c => c.status === 1);
   const activeAuthAccounts = authAccounts.filter(a => !a.disabled);
 
-  // Unified channel options for dropdown
-  const channelOptions = useMemo(() => {
+  // 仅普通 API 渠道参与 allowed/denied_channels；Auth 账号按设计不受渠道限制。
+  const channelPickerOptions = useMemo(() => {
     const opts: { id: string; label: string; group: string; models: string[] }[] = [];
     activeChannels.forEach(c => {
       const models = [
@@ -341,18 +341,37 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
       ];
       opts.push({ id: c.id, label: c.name, group: "API 渠道", models: [...new Set(models)] });
     });
+    return opts;
+  }, [activeChannels]);
+
+  // 标签展示仍保留 Auth 账号，便于编辑旧数据时识别已保存项。
+  const labelOptions = useMemo(() => {
+    const opts: { id: string; label: string }[] = [];
+    activeChannels.forEach(c => {
+      opts.push({ id: c.id, label: c.name });
+    });
     activeAuthAccounts.forEach(a => {
-      const models = [
-        ...a.models.filter(m => !m.unavailable).map(m => m.id),
-        ...(a.model_mapping ? Object.keys(a.model_mapping) : []),
-      ];
-      opts.push({ id: a.id, label: a.label, group: "Auth 账号", models: [...new Set(models)] });
+      opts.push({ id: a.id, label: a.label });
     });
     return opts;
   }, [activeChannels, activeAuthAccounts]);
 
-  const channelLabel = (id: string) => channelOptions.find(c => c.id === id)?.label ?? id;
-  const channelModels = (id: string) => channelOptions.find(c => c.id === id)?.models ?? [];
+  // 模型限制是全局的：既可作用于 API 渠道，也可作用于 Auth 账号。
+  const allModelOptions = useMemo(() => {
+    const modelSet = new Set<string>();
+    activeChannels.forEach(c => {
+      c.models.forEach(m => modelSet.add(m));
+      if (c.model_mapping) Object.keys(c.model_mapping).forEach(m => modelSet.add(m));
+    });
+    activeAuthAccounts.forEach(a => {
+      a.models.filter(m => !m.unavailable).forEach(m => modelSet.add(m.id));
+      if (a.model_mapping) Object.keys(a.model_mapping).forEach(m => modelSet.add(m));
+    });
+    return [...modelSet].map(m => ({ id: m, label: m }));
+  }, [activeChannels, activeAuthAccounts]);
+
+  const channelLabel = (id: string) => labelOptions.find(c => c.id === id)?.label ?? id;
+  const channelModels = (id: string) => channelPickerOptions.find(c => c.id === id)?.models ?? [];
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -521,15 +540,15 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
     const [selChannels, setSelChannels] = useState<string[]>([]);
     const [selModels, setSelModels] = useState<string[]>([]);
 
-    // Models linked to selected channels (union of all selected channels' models)
+    // 同时选渠道 + 模型时，仅用于批量添加；真实生效仍是独立的 channel/model 数组。
     const modelOptions = useMemo(() => {
-      if (selChannels.length === 0) return [];
+      if (selChannels.length === 0) return allModelOptions;
       const modelSet = new Set<string>();
       selChannels.forEach(chId => {
         channelModels(chId).forEach(m => modelSet.add(m));
       });
       return [...modelSet].map(m => ({ id: m, label: m }));
-    }, [selChannels]);
+    }, [selChannels, allModelOptions]);
 
     const canAdd = selChannels.length > 0 || selModels.length > 0;
 
@@ -584,7 +603,7 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
               setSelModels([]); // reset model selection when channels change
             }}
             onClear={() => { setSelChannels([]); setSelModels([]); }}
-            options={channelOptions.map(c => ({ id: c.id, label: c.label, group: c.group }))}
+            options={channelPickerOptions.map(c => ({ id: c.id, label: c.label, group: c.group }))}
             placeholder="选择渠道"
             grouped
           />
@@ -593,13 +612,16 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
             onToggle={(id) => setSelModels(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])}
             onClear={() => setSelModels([])}
             options={modelOptions}
-            placeholder={selChannels.length > 0 ? "选择模型" : "先选渠道"}
+            placeholder={selChannels.length > 0 ? "选择模型" : "选择模型（可单独限制）"}
           />
           <button type="button" onClick={handleAdd} disabled={!canAdd}
             className="action-primary shrink-0 px-3 py-2.5 text-sm disabled:opacity-40 disabled:cursor-not-allowed">
             <Plus size={15} />
           </button>
         </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          渠道与模型限制分别独立生效；同时选择只是批量添加。渠道白/黑名单仅作用于 API 渠道，Auth 账号请使用模型限制。
+        </p>
 
         {/* Rules table */}
         <div className="mt-3">
@@ -641,6 +663,9 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
                 <span className="rounded-full bg-amber-100/60 px-2 py-0.5 text-xs text-amber-600">未配置则不限制</span>
               )}
             </div>
+            <p className="mb-3 text-xs text-muted-foreground">
+              当前后端实际存储为 4 组独立数组：允许渠道、允许模型、拒绝渠道、拒绝模型。
+            </p>
             <div className="space-y-3">
               <RestrictionSection
                 title="白名单"

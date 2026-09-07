@@ -3852,16 +3852,66 @@ struct ConfigModel {
     owned_by: String,
 }
 
-/// Aggregate configured models across enabled channels, deduped:
+/// `/v1/models` 需要按 API Key 的黑白名单裁剪可见模型。
+/// 这里复用与运行时一致的四组数组语义：
+/// - `allowed_channels` / `denied_channels` 仅作用于普通 API 渠道；
+/// - Auth 账号没有 channel id，沿用既有设计：渠道限制不约束账号；
+/// - `allowed_models` / `denied_models` 同时作用于渠道与账号模型。
+#[derive(Debug, Clone, Default)]
+struct ApiKeyVisibility {
+    allowed_channels: std::collections::HashSet<String>,
+    denied_channels: std::collections::HashSet<String>,
+    allowed_models: std::collections::HashSet<String>,
+    denied_models: std::collections::HashSet<String>,
+}
+
+impl From<&crate::db::models::ApiKey> for ApiKeyVisibility {
+    fn from(key: &crate::db::models::ApiKey) -> Self {
+        Self {
+            allowed_channels: serde_json::from_str(&key.allowed_channels).unwrap_or_default(),
+            denied_channels: serde_json::from_str(&key.denied_channels).unwrap_or_default(),
+            allowed_models: serde_json::from_str(&key.allowed_models).unwrap_or_default(),
+            denied_models: serde_json::from_str(&key.denied_models).unwrap_or_default(),
+        }
+    }
+}
+
+impl ApiKeyVisibility {
+    fn channel_allowed(&self, channel_id: &str) -> bool {
+        (self.allowed_channels.is_empty() || self.allowed_channels.contains(channel_id))
+            && !self.denied_channels.contains(channel_id)
+    }
+
+    fn model_allowed(&self, model: &str) -> bool {
+        (self.allowed_models.is_empty() || self.allowed_models.contains(model))
+            && !self.denied_models.contains(model)
+    }
+}
+
+/// Aggregate configured models across channels, deduped:
 /// each channel's `models` list, then the keys of its `model_mapping`
-/// (mapping values are upstream model names and are NOT exposed).
-fn collect_config_models(channels: &[crate::db::models::Channel]) -> Vec<ConfigModel> {
+/// (mapping values are upstream model names and are NOT exposed). When
+/// `visibility` is provided, channel/model black白名单会在聚合时生效。
+fn collect_config_models(
+    channels: &[crate::db::models::Channel],
+    visibility: Option<&ApiKeyVisibility>,
+) -> Vec<ConfigModel> {
     let mut out: Vec<ConfigModel> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for ch in channels {
+        if visibility
+            .map(|rules| !rules.channel_allowed(&ch.id))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let ch_models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
         for m in ch_models {
-            if seen.insert(m.clone()) {
+            if visibility
+                .map(|rules| rules.model_allowed(&m))
+                .unwrap_or(true)
+                && seen.insert(m.clone())
+            {
                 out.push(ConfigModel {
                     id: m,
                     owned_by: ch.channel_type.clone(),
@@ -3872,7 +3922,11 @@ fn collect_config_models(channels: &[crate::db::models::Channel]) -> Vec<ConfigM
             .unwrap_or(serde_json::Value::Object(Default::default()));
         if let Some(obj) = mapping.as_object() {
             for key in obj.keys() {
-                if seen.insert(key.clone()) {
+                if visibility
+                    .map(|rules| rules.model_allowed(key))
+                    .unwrap_or(true)
+                    && seen.insert(key.clone())
+                {
                     out.push(ConfigModel {
                         id: key.clone(),
                         owned_by: ch.channel_type.clone(),
@@ -3890,9 +3944,11 @@ fn collect_config_models(channels: &[crate::db::models::Channel]) -> Vec<ConfigM
 /// are NOT exposed).  `owned_by` is the account provider.  Dedup is shared with
 /// the channel aggregator via `seen` so a model advertised by both a channel
 /// and an account is listed once (channel wins, preserving `owned_by`).
+/// 渠道白/黑名单不约束账号；若给出 `visibility`，仅应用模型白/黑名单。
 fn collect_auth_account_models(
     accounts: &[crate::db::models::AuthAccount],
     seen: &mut std::collections::HashSet<String>,
+    visibility: Option<&ApiKeyVisibility>,
 ) -> Vec<ConfigModel> {
     let mut out: Vec<ConfigModel> = Vec::new();
     for account in accounts {
@@ -3900,6 +3956,9 @@ fn collect_auth_account_models(
             for state in &states.models {
                 if state.status == "available"
                     && !state.unavailable
+                    && visibility
+                        .map(|rules| rules.model_allowed(&state.id))
+                        .unwrap_or(true)
                     && seen.insert(state.id.clone())
                 {
                     out.push(ConfigModel {
@@ -3912,7 +3971,11 @@ fn collect_auth_account_models(
         if let Ok(mapping) = account.model_mapping() {
             if let Some(obj) = mapping.as_object() {
                 for key in obj.keys() {
-                    if seen.insert(key.clone()) {
+                    if visibility
+                        .map(|rules| rules.model_allowed(key))
+                        .unwrap_or(true)
+                        && seen.insert(key.clone())
+                    {
                         out.push(ConfigModel {
                             id: key.clone(),
                             owned_by: account.provider.clone(),
@@ -4050,13 +4113,18 @@ async fn list_models_impl(pool: SqlitePool, headers: &HeaderMap) -> Response {
             )
         }
     };
+    let visibility = ApiKeyVisibility::from(&key);
     let mut seen = std::collections::HashSet::new();
-    let mut models = collect_config_models(&channels);
+    let mut models = collect_config_models(&channels, Some(&visibility));
     // Track channel-advertised IDs so auth-account duplicates are skipped.
     for m in &models {
         seen.insert(m.id.clone());
     }
-    models.extend(collect_auth_account_models(&accounts, &mut seen));
+    models.extend(collect_auth_account_models(
+        &accounts,
+        &mut seen,
+        Some(&visibility),
+    ));
     let body = if anthropic {
         anthropic_models_response(&models)
     } else {
@@ -4453,7 +4521,7 @@ mod list_models_tests {
                 serde_json::json!({"gpt-4o": "claude-sonnet-5", "claude-35": "claude-3-5-sonnet"}),
             ),
         ];
-        let models = collect_config_models(&channels);
+        let models = collect_config_models(&channels, None);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         // a.models → gpt-4o, gpt-4o-mini；a.mapping keys → gpt-4o(重复跳过)；
         // b.models → claude-sonnet-4；b.mapping keys → gpt-4o(重复跳过), claude-35
@@ -4474,9 +4542,114 @@ mod list_models_tests {
             &["real-a"],
             serde_json::json!({"alias": "upstream-y"}),
         )];
-        let models = collect_config_models(&channels);
+        let models = collect_config_models(&channels, None);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["real-a", "alias"]);
+    }
+
+    fn key(
+        allowed_channels: &[&str],
+        denied_channels: &[&str],
+        allowed_models: &[&str],
+        denied_models: &[&str],
+    ) -> ApiKey {
+        ApiKey {
+            id: "key-1".to_string(),
+            name: "key-1".to_string(),
+            key: "sk-waliapi-test".to_string(),
+            status: 1,
+            allowed_models: serde_json::to_string(allowed_models).unwrap(),
+            allowed_channels: serde_json::to_string(allowed_channels).unwrap(),
+            denied_models: serde_json::to_string(denied_models).unwrap(),
+            denied_channels: serde_json::to_string(denied_channels).unwrap(),
+            quota_limit: -1,
+            quota_used: 0,
+            expires_at: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+        }
+    }
+
+    fn account(
+        id: &str,
+        provider: &str,
+        models: &[&str],
+        mapping: serde_json::Value,
+    ) -> crate::db::models::AuthAccount {
+        crate::db::models::AuthAccount {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            label: id.to_string(),
+            account_id: id.to_string(),
+            status: "active".to_string(),
+            disabled: 0,
+            priority: 0,
+            weight: 1,
+            quota_json: None,
+            model_states_json: serde_json::json!({
+                "version": 1,
+                "models": models.iter().map(|m| serde_json::json!({
+                    "id": m,
+                    "status": "available",
+                    "unavailable": false,
+                    "next_retry_after": null,
+                    "last_error": null
+                })).collect::<Vec<_>>()
+            })
+            .to_string(),
+            model_mapping_json: mapping.to_string(),
+            attributes_json: "{}".to_string(),
+            payload_json: "{}".to_string(),
+            last_refreshed_at: None,
+            last_models_sync_at: None,
+            next_refresh_after: None,
+            next_retry_after: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn visible_channel_models_follow_key_channel_and_model_rules() {
+        let channels = vec![
+            channel(
+                "api-a",
+                "openai",
+                &["gpt-4o", "gpt-4o-mini"],
+                serde_json::json!({"alias-a": "gpt-4o"}),
+            ),
+            channel(
+                "api-b",
+                "claude",
+                &["claude-sonnet-4"],
+                serde_json::json!({"alias-b": "claude-sonnet-4"}),
+            ),
+        ];
+        let visibility =
+            ApiKeyVisibility::from(&key(&["api-a"], &[], &["gpt-4o", "alias-a"], &["gpt-4o-mini"]));
+        let models = collect_config_models(&channels, Some(&visibility));
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["gpt-4o", "alias-a"]);
+    }
+
+    #[test]
+    fn visible_auth_models_ignore_channel_lists_but_honor_model_rules() {
+        let accounts = vec![account(
+            "acct-1",
+            "codex",
+            &["gpt-5", "gpt-5-mini"],
+            serde_json::json!({"alias-auth": "gpt-5"}),
+        )];
+        let visibility = ApiKeyVisibility::from(&key(
+            &["some-channel"],
+            &["acct-1"],
+            &["gpt-5", "alias-auth"],
+            &["gpt-5-mini"],
+        ));
+        let mut seen = std::collections::HashSet::new();
+        let models = collect_auth_account_models(&accounts, &mut seen, Some(&visibility));
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["gpt-5", "alias-auth"]);
     }
 
     #[test]
