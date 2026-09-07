@@ -1,6 +1,6 @@
 use super::router::SharedState;
 use crate::adaptor::{get_adaptor, ProxyRequest};
-use crate::core::attempt::{upstream_failover_decision, FailoverDecision};
+use crate::core::attempt::{upstream_failover_decision_with_body, FailoverDecision};
 use crate::core::dispatcher::Dispatcher;
 use crate::core::feature_flags;
 use crate::core::proxy;
@@ -159,7 +159,7 @@ async fn maybe_route_plan(
                 .into_response()
         })?;
     let mut plan_rng = rand::rngs::StdRng::from_os_rng();
-    let plan = match route_plan::authorize_and_plan_with_accounts(
+    let mut plan = match route_plan::authorize_and_plan_with_accounts(
         key,
         &audited.envelope.model,
         endpoint,
@@ -170,8 +170,7 @@ async fn maybe_route_plan(
         &mut plan_rng,
     ) {
         Ok(plan) => plan,
-        Err(e) => {
-            let code = e.http_status();
+        Err(e) => {            let code = e.http_status();
             // I-3: a facade rejection (auth / no candidate / no endpoint)
             // must be observable in the RequestLog on BOTH paths, except for
             // Count Tokens which is deliberately excluded from request history.
@@ -200,6 +199,16 @@ async fn maybe_route_plan(
             ));
         }
     };
+    // GAP-08：重试策略设置对主路径生效——映射为 RoutePlan 尝试预算（组内
+    // = 次数+1、总量 = ×2，与既有默认 3/6 一致；关闭重试 → 1/1 真正不重试）。
+    // 此前该设置只作用于 legacy 轨，主路径预算硬编码。
+    {
+        let (retry_enabled, retry_times) =
+            crate::core::proxy::get_retry_settings(&shared.state.settings);
+        let (per_group, total) =
+            route_plan::retry_budget_from_settings(retry_enabled, retry_times);
+        plan.apply_retry_budget(per_group, total);
+    }
     if is_stream {
         let resp = crate::endpoint_executor::driver::route_stream_plan_with_auth_service(
             plan,
@@ -211,6 +220,10 @@ async fn maybe_route_plan(
             sanitized_log_body,
             trace_id,
             shared.state.auth_service.clone(),
+            // 流式超时（FIX-08）从设置读取（stream.*_timeout_secs，缺省 60/120s）。
+            crate::endpoint_executor::driver::StreamTimeouts::from_settings(
+                &shared.state.settings,
+            ),
         )
         .await;
         Ok(Some(resp))
@@ -875,7 +888,7 @@ async fn handle_stream(
                 if !status.is_success() {
                     let body_str = resp.text().await.unwrap_or_default();
                     last_error = Some(format!("{}: {}", channel.name, body_str));
-                    match upstream_failover_decision(status.as_u16()) {
+                    match upstream_failover_decision_with_body(status.as_u16(), Some(&body_str)) {
                         FailoverDecision::Failover => continue,
                         FailoverDecision::Stop { downstream_status } => {
                             // Nothing has been streamed yet — stop cycling
@@ -970,24 +983,17 @@ async fn handle_stream(
                                     }
                                     Err(e) => {
                                         had_error = true;
-                                        let err_chunk = format!(
-                                            "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
-                                            e
-                                        );
+                                        // FIX-20：错误帧经 serde_json 构造，杜绝非法 JSON。
+                                        let err_chunk = crate::endpoint_executor::driver::format_stream_error("chat", &format!("Upstream conversion failed: {e}"));
                                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
-                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                                         break;
                                     }
                                 }
                             }
                             Err(e) => {
                                 had_error = true;
-                                let err_chunk = format!(
-                                    "data: {{\"error\":{{\"message\":\"Stream connection interrupted: {}\",\"type\":\"server_error\"}}}}\n\n",
-                                    e
-                                );
+                                let err_chunk = crate::endpoint_executor::driver::format_stream_error("chat", &format!("Stream connection interrupted: {e}"));
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
-                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                                 break;
                             }
                         }
@@ -1016,12 +1022,8 @@ async fn handle_stream(
                             }
                             Err(e) => {
                                 had_error = true;
-                                let err_chunk = format!(
-                                    "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
-                                    e
-                                );
+                                let err_chunk = crate::endpoint_executor::driver::format_stream_error("chat", &format!("Upstream conversion failed: {e}"));
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
-                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                             }
                         }
                     }
@@ -1290,10 +1292,19 @@ async fn native_anthropic_request(
     };
     let url = native_anthropic_url(config, path, query);
     let (mapped_body, upstream_model) = mapped_anthropic_body(body, &config.model_mapping);
-    // count_tokens is always non-streaming; native Anthropic Messages streams
-    // through this same function, so use a streaming client (connect-timeout
-    // only) to avoid cutting off long SSE generations.
-    let client = crate::adaptor::streaming_client();
+    // FIX-12：仅流式 Messages 用只设连接超时的流式客户端；非流式 Messages
+    // 与 count_tokens 是普通 JSON 请求，必须受渠道总超时约束（此前一律用
+    // 流式客户端，上游挂死时请求永久悬挂无法切换渠道）。
+    let is_stream = !count_tokens
+        && body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    let client = if is_stream {
+        crate::adaptor::streaming_client()
+    } else {
+        crate::adaptor::blocking_client(config.timeout_secs)
+    };
     let mut request = client
         .post(url)
         .header("x-api-key", &config.api_key)
@@ -1371,10 +1382,137 @@ struct StreamLogContext {
     upstream_model: Option<String>,
     request: serde_json::Value,
     security: security::SecurityScanResult,
+    /// FIX-16：请求准入时的安全设置快照——响应侧扫描沿用同一口径。
+    security_settings: security::SecuritySettings,
     is_stream: bool,
 }
 
 const MAX_NATIVE_SSE_RECORD_BYTES: usize = 64 * 1024;
+
+/// 原生 Anthropic 流的落账 finalizer（FIX-12）：正常完成在流结尾显式落账
+/// 并 `mark_done`；客户端断开导致生成器被 Drop 时，此处写 499 行——带解析
+/// 到的部分用量，无用量时按请求体本地估算，任何情况都有日志行。
+struct NativeStreamFinalizer {
+    repo: std::sync::Arc<Repository>,
+    key: crate::db::models::ApiKey,
+    channel: crate::db::models::Channel,
+    model: String,
+    upstream_model: Option<String>,
+    request: serde_json::Value,
+    security: security::SecurityScanResult,
+    security_settings: security::SecuritySettings,
+    /// FIX-16：与转发循环共享的响应扫描累积器——断开/中断行扫半程内容。
+    scan_buffer: std::sync::Arc<std::sync::Mutex<ResponseScanBuffer>>,
+    is_stream: bool,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl NativeStreamFinalizer {
+    fn from_context(
+        ctx: &StreamLogContext,
+        scan_buffer: std::sync::Arc<std::sync::Mutex<ResponseScanBuffer>>,
+    ) -> Self {
+        Self {
+            repo: ctx.repo.clone(),
+            key: ctx.key.clone(),
+            channel: ctx.channel.clone(),
+            model: ctx.model.clone(),
+            upstream_model: ctx.upstream_model.clone(),
+            request: ctx.request.clone(),
+            security: ctx.security.clone(),
+            security_settings: ctx.security_settings.clone(),
+            scan_buffer,
+            is_stream: ctx.is_stream,
+            done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// FIX-16：请求审计 + 已累积响应内容的合并结果（断开/中断路径共用）。
+    fn merged_security(&self) -> security::SecurityScanResult {
+        let mut merged = self.security.clone();
+        let partial = self
+            .scan_buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buf
+            .clone();
+        scan_bytes_into(&mut merged, &partial, &self.security_settings);
+        merged
+    }
+
+    fn mark_done(&self) {
+        self.done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 上游中断：502 行 + 已解析的部分用量。
+    async fn record_interrupted(&self, partial_usage: Option<(i64, i64, i64)>) {
+        let usage = partial_usage.or_else(|| self.estimated_usage());
+        let merged = self.merged_security();
+        record_anthropic_outcome(
+            self.repo.clone(),
+            &self.key,
+            Some(&self.channel),
+            &self.model,
+            self.upstream_model.clone(),
+            &self.request,
+            &merged,
+            self.is_stream,
+            502,
+            Some("native upstream stream interrupted".to_string()),
+            usage,
+        )
+        .await;
+    }
+
+    /// 请求体 prompt 估算（completion 无内容可估时为 0）。
+    fn estimated_usage(&self) -> Option<(i64, i64, i64)> {
+        let req_body =
+            serde_json::to_value(&self.request).unwrap_or(serde_json::Value::Null);
+        let (p, c, t) = crate::endpoint_executor::estimate_usage::estimate_usage(
+            &req_body,
+            None,
+            &self.model,
+        );
+        (t > 0).then_some((p, c, t))
+    }
+}
+
+impl Drop for NativeStreamFinalizer {
+    fn drop(&mut self) {
+        // FIX-26 同款守卫：应用退出中 Drop 不 spawn，避免 runtime 关停 panic。
+        if !self.done.load(std::sync::atomic::Ordering::SeqCst) {
+            self.mark_done();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let repo = self.repo.clone();
+                let key = self.key.clone();
+                let channel = self.channel.clone();
+                let model = self.model.clone();
+                let upstream_model = self.upstream_model.clone();
+                let request = self.request.clone();
+                let security = self.merged_security();
+                let is_stream = self.is_stream;
+                let usage = self.estimated_usage();
+                handle.spawn(async move {
+                    record_anthropic_outcome(
+                        repo,
+                        &key,
+                        Some(&channel),
+                        &model,
+                        upstream_model,
+                        &request,
+                        &security,
+                        is_stream,
+                        499,
+                        Some("client_cancelled".to_string()),
+                        usage,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+}
 
 /// Incrementally extracts the cumulative usage fields from a native Anthropic
 /// SSE stream.  It deliberately retains at most one bounded record rather
@@ -1438,14 +1576,11 @@ impl NativeSseUsageParser {
         }
     }
 
-    fn finish(self) -> Option<(i64, i64, i64)> {
-        (!self.malformed_or_oversized && self.stopped).then(|| {
-            (
-                self.input.unwrap_or(0),
-                self.output.unwrap_or(0),
-                self.cached.unwrap_or(0),
-            )
-        })
+    /// FIX-12：改 `&mut self`——解析器在 Mutex 内共享，Drop/中断路径需要
+    /// 多次读取部分用量而不消耗解析器。
+    fn finish(&mut self) -> Option<(i64, i64, i64)> {
+        (!self.malformed_or_oversized && self.stopped)
+            .then(|| (self.input.unwrap_or(0), self.output.unwrap_or(0), self.cached.unwrap_or(0)))
     }
 }
 
@@ -1503,6 +1638,48 @@ fn anthropic_input_usage(usage: &serde_json::Value) -> i64 {
             .unwrap_or(0)
 }
 
+/// FIX-16：响应侧扫描的有界原始字节累积器。超限即停（保留前缀），
+/// `cap == 0` 表示扫描关闭、完全不累积。
+struct ResponseScanBuffer {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl ResponseScanBuffer {
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.cap == 0 || self.buf.len() >= self.cap {
+            return;
+        }
+        let room = self.cap - self.buf.len();
+        self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    fn enabled_for(settings: &security::SecuritySettings) -> usize {
+        if settings.enabled && settings.scan_response {
+            settings.max_scan_bytes
+        } else {
+            0
+        }
+    }
+}
+
+/// FIX-16：把响应原始字节（UTF-8 宽松解码）扫入审计结果（尽力而为）。
+fn scan_bytes_into(
+    audit: &mut security::SecurityScanResult,
+    bytes: &[u8],
+    settings: &security::SecuritySettings,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    security::scan_response_into(
+        audit,
+        &serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned()),
+        settings,
+        &[],
+    );
+}
+
 fn native_response(response: reqwest::Response, accounting: Option<StreamLogContext>) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1515,17 +1692,40 @@ fn native_response(response: reqwest::Response, accounting: Option<StreamLogCont
     let upstream = response.bytes_stream();
     let stream = async_stream::stream! {
         tokio::pin!(upstream);
-        let mut usage_parser = NativeSseUsageParser::default();
+        // FIX-12：usage 解析器放共享锁，客户端断开时 Drop 路径可取部分用量。
+        let usage_parser = std::sync::Arc::new(std::sync::Mutex::new(NativeSseUsageParser::default()));
         // A non-streaming Messages response is a small JSON object in normal
         // operation.  Keep a hard cap for accounting so a malicious upstream
         // can never turn the proxy into an unbounded collector.
         let mut non_sse_observed = Vec::new();
+        // FIX-12：断开/中断/完成统一落账——客户端中途断开时生成器被丢弃，
+        // 尾部落账代码不会执行，由 finalizer 的 Drop 路径写 499 行（带部分
+        // 用量）；上游中断写 502 行；正常完成写 200 行（usage 缺失时走
+        // record_anthropic_outcome 内建的估算兜底，不再静默丢行）。
+        // FIX-16：SSE 原始字节有界累积（非 SSE 已有 non_sse_observed 全量），
+        // 与 finalizer 共享——完成/断开/中断行都做响应侧扫描。
+        let scan_cap = accounting
+            .as_ref()
+            .map(|ctx| ResponseScanBuffer::enabled_for(&ctx.security_settings))
+            .unwrap_or(0);
+        let scan_buffer = std::sync::Arc::new(std::sync::Mutex::new(ResponseScanBuffer {
+            buf: Vec::new(),
+            cap: scan_cap,
+        }));
+        let finalizer = accounting
+            .as_ref()
+            .map(|ctx| NativeStreamFinalizer::from_context(ctx, scan_buffer.clone()));
         let mut completed = true;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(bytes) => {
                     if is_sse {
-                        usage_parser.feed(&bytes);
+                        let mut parser = usage_parser.lock().unwrap_or_else(|e| e.into_inner());
+                        parser.feed(&bytes);
+                        scan_buffer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .feed(&bytes);
                     } else if non_sse_observed.len().saturating_add(bytes.len()) <= MAX_NATIVE_SSE_RECORD_BYTES {
                         non_sse_observed.extend_from_slice(&bytes);
                     }
@@ -1536,12 +1736,38 @@ fn native_response(response: reqwest::Response, accounting: Option<StreamLogCont
         }
         if let Some(context) = accounting {
             if completed {
-                let usage = if is_sse { usage_parser.finish() } else { native_usage(&non_sse_observed, false) };
-                if let Some(usage) = usage {
-                    record_anthropic_success(context.repo, &context.key, &context.channel, &context.model, context.upstream_model.clone(), &context.request, &context.security, context.is_stream, Some(usage)).await;
-                }
+                let usage = if is_sse {
+                    let mut parser = usage_parser.lock().unwrap_or_else(|e| e.into_inner());
+                    parser.finish()
+                } else {
+                    native_usage(&non_sse_observed, false)
+                };
+                // usage 为 None 也落行：record_anthropic_outcome 对 2xx 有本地估算兜底。
+                // FIX-16：响应侧扫描并入审计——非 SSE 扫全量 body，SSE 扫有界累积。
+                let mut merged_security = context.security.clone();
+                let scan_bytes: Vec<u8> = if is_sse {
+                    scan_buffer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .buf
+                        .clone()
+                } else {
+                    non_sse_observed.clone()
+                };
+                scan_bytes_into(&mut merged_security, &scan_bytes, &context.security_settings);
+                record_anthropic_success(context.repo, &context.key, &context.channel, &context.model, context.upstream_model.clone(), &context.request, &merged_security, context.is_stream, usage).await;
+            } else if let Some(f) = finalizer.as_ref() {
+                // 上游中断：502 行 + 已解析的部分用量（估算兜底同取消路径）。
+                let partial = {
+                    let mut parser = usage_parser.lock().unwrap_or_else(|e| e.into_inner());
+                    parser.finish()
+                };
+                f.record_interrupted(partial).await;
+                // 已落账，阻止 Drop 重复写 499。
+                f.mark_done();
             }
         }
+        drop(finalizer);
     };
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
@@ -1577,6 +1803,65 @@ async fn store_native_error(response: reqwest::Response) -> StoredNativeError {
         content_type,
         headers,
         body,
+    }
+}
+
+/// FIX-18（#15）：请求体是否含图片内容块（Anthropic `{"type":"image"}` /
+/// OpenAI `{"type":"image_url"}`）。仅用于诊断提示，不参与路由决策（fail-open）。
+fn request_has_image_blocks(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            matches!(
+                                part.get("type").and_then(|t| t.as_str()),
+                                Some("image") | Some("image_url")
+                            )
+                        })
+                    })
+            })
+        })
+}
+
+/// FIX-18（#15）：原生渠道 400 且请求含图片块时，在错误体 message 追加
+/// 诊断提示。视觉能力路由（`supports_vision` 渠道标记 + failover 跳过）
+/// 为长期方案（docs/reliability-fixes-prd.md 票 03），当前只提示不改路由。
+fn annotate_vision_hint(
+    err: StoredNativeError,
+    request: &serde_json::Value,
+) -> StoredNativeError {
+    const HINT: &str =
+        "（该渠道疑似不支持图片：请求含图片内容块而上游以 400 拒绝，可切换到支持视觉的渠道）";
+    if err.status != StatusCode::BAD_REQUEST || !request_has_image_blocks(request) {
+        return err;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&err.body) else {
+        return err;
+    };
+    // Anthropic 错误体为 {"type":"error","error":{"type":...,"message":...}}，
+    // 兼容扁平 {"message": ...} 形态。
+    let message = match value.pointer_mut("/error/message") {
+        Some(message) => Some(message),
+        None => value.get_mut("message"),
+    };
+    if let Some(serde_json::Value::String(text)) = message {
+        if !text.contains("该渠道疑似不支持图片") {
+            text.push_str(HINT);
+        }
+    }
+    let Ok(body) = serde_json::to_vec(&value) else {
+        return err;
+    };
+    StoredNativeError {
+        status: err.status,
+        content_type: err.content_type,
+        headers: err.headers,
+        body: bytes::Bytes::from(body),
     }
 }
 
@@ -1945,6 +2230,7 @@ pub async fn handle_messages(
                             upstream_model,
                             request: sanitized_log_json.clone(),
                             security: security_result.clone(),
+                            security_settings: audited.security_settings.clone(),
                             is_stream: stream,
                         }),
                     )
@@ -1952,10 +2238,16 @@ pub async fn handle_messages(
                 Ok((response, upstream_model)) => {
                     let status = StatusCode::from_u16(response.status().as_u16())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
-                    match upstream_failover_decision(status.as_u16()) {
+                    // FIX-25：先取错误体供 404 语义判定（两个分支都要用）。
+                    let native_err = store_native_error(response).await;
+                    let err_body_text = String::from_utf8_lossy(&native_err.body).to_string();
+                    match upstream_failover_decision_with_body(
+                        status.as_u16(),
+                        Some(&err_body_text),
+                    ) {
                         FailoverDecision::Failover => {
                             last_error = format!("{}: HTTP {}", channel.name, status);
-                            last_native_error = Some(store_native_error(response).await);
+                            last_native_error = Some(native_err);
                         }
                         FailoverDecision::Stop { downstream_status } => {
                             record_anthropic_outcome(
@@ -1982,7 +2274,11 @@ pub async fn handle_messages(
                                     "Upstream channel authentication failed",
                                 );
                             }
-                            return native_response(response, None);
+                            // FIX-18（#15）：400 + 图片块 → 追加视觉诊断提示。
+                            return stored_native_response(annotate_vision_hint(
+                                native_err,
+                                &forward_json,
+                            ));
                         }
                     }
                 }
@@ -2034,6 +2330,7 @@ pub async fn handle_messages(
                         upstream_model,
                         request: sanitized_log_json.clone(),
                         security: security_result.clone(),
+                        security_settings: audited.security_settings.clone(),
                         is_stream: true,
                     },
                 )
@@ -2062,6 +2359,14 @@ pub async fn handle_messages(
                                 .and_then(|value| value.as_i64())
                                 .unwrap_or(0),
                         ));
+                        // FIX-16：响应侧扫描并入审计后落账（尽力而为）。
+                        let mut merged_security = security_result.clone();
+                        security::scan_response_into(
+                            &mut merged_security,
+                            &body,
+                            &audited.security_settings,
+                            &[],
+                        );
                         record_anthropic_success(
                             repo.clone(),
                             &key,
@@ -2069,7 +2374,7 @@ pub async fn handle_messages(
                             &model,
                             upstream_model,
                             &sanitized_log_json,
-                            &security_result,
+                            &merged_security,
                             false,
                             usage,
                         )
@@ -2080,6 +2385,13 @@ pub async fn handle_messages(
                         // A 200 transport response is not a usable channel if
                         // its tool arguments/content cannot satisfy Messages.
                         last_error = format!("{}: conversion failed: {message}", channel.name);
+                        let mut merged_security = security_result.clone();
+                        security::scan_response_into(
+                            &mut merged_security,
+                            &body,
+                            &audited.security_settings,
+                            &[],
+                        );
                         record_anthropic_outcome(
                             repo.clone(),
                             &key,
@@ -2087,7 +2399,7 @@ pub async fn handle_messages(
                             &model,
                             upstream_model,
                             &sanitized_log_json,
-                            &security_result,
+                            &merged_security,
                             false,
                             502,
                             Some(message),
@@ -2110,7 +2422,7 @@ pub async fn handle_messages(
                     .and_then(|value| value.as_str())
                     .unwrap_or("OpenAI Chat Completions upstream rejected the request");
                 last_error = format!("{}: {message}", channel.name);
-                match upstream_failover_decision(status.as_u16()) {
+                match upstream_failover_decision_with_body(status.as_u16(), Some(upstream.to_string().as_str())) {
                     FailoverDecision::Failover => {
                         last_openai_error = Some((status, message.to_string(), response_headers));
                     }
@@ -2210,21 +2522,33 @@ fn openai_sse_response(
         tokio::pin!(upstream);
         let mut state = crate::protocol::anthropic::AnthropicStreamState::default();
         let mut failed = false;
+        // FIX-16：上游 OpenAI SSE 原始字节有界累积，落账前做响应侧扫描。
+        let mut scan_buffer = ResponseScanBuffer {
+            buf: Vec::new(),
+            cap: ResponseScanBuffer::enabled_for(&accounting.security_settings),
+        };
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(bytes) => match state.feed(&bytes, &model, &message_id) {
+                Ok(bytes) => {
+                    scan_buffer.feed(&bytes);
+                    match state.feed(&bytes, &model, &message_id) {
                     Ok(events) => for event in events { yield Ok::<_, std::io::Error>(bytes::Bytes::from(event.into_bytes())); },
                     Err(message) => {
                         failed = true;
-                        record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &accounting.security, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None).await;
+                        let mut merged = accounting.security.clone();
+                        scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
+                        record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None).await;
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{}}}}}\n\n", serde_json::to_string(&message).unwrap()).into_bytes()));
                         break;
                     }
-                },
+                    }
+                }
                 Err(error) => {
                     failed = true;
                     let message = format!("OpenAI stream interrupted: {error}");
-                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &accounting.security, true, 502, Some(message.clone()), None).await;
+                    let mut merged = accounting.security.clone();
+                    scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
+                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(message.clone()), None).await;
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{}}}}}\n\n", serde_json::to_string(&message).unwrap()).into_bytes()));
                     break;
                 }
@@ -2235,10 +2559,14 @@ fn openai_sse_response(
                 Ok(events) => {
                     for event in events { yield Ok::<_, std::io::Error>(bytes::Bytes::from(event.into_bytes())); }
                     let usage = state.usage();
-                    record_anthropic_success(accounting.repo, &accounting.key, &accounting.channel, &accounting.model, None, &accounting.request, &accounting.security, true, Some(usage)).await;
+                    let mut merged = accounting.security.clone();
+                    scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
+                    record_anthropic_success(accounting.repo, &accounting.key, &accounting.channel, &accounting.model, None, &accounting.request, &merged, true, Some(usage)).await;
                 },
                 Err(message) => {
-                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &accounting.security, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None).await;
+                    let mut merged = accounting.security.clone();
+                    scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
+                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None).await;
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{}}}}}\n\n", serde_json::to_string(&message).unwrap()).into_bytes()))
                 },
             }
@@ -2387,9 +2715,12 @@ pub async fn handle_messages_count_tokens(
             Ok((response, _upstream_model)) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
-                match upstream_failover_decision(status.as_u16()) {
+                // FIX-25：先取错误体供 404 语义判定（两个分支都要用）。
+                let native_err = store_native_error(response).await;
+                let err_body_text = String::from_utf8_lossy(&native_err.body).to_string();
+                match upstream_failover_decision_with_body(status.as_u16(), Some(&err_body_text)) {
                     FailoverDecision::Failover => {
-                        last_error = Some(store_native_error(response).await);
+                        last_error = Some(native_err);
                     }
                     FailoverDecision::Stop { downstream_status } => {
                         // Mask a channel-credential failure (401/403) to 502;
@@ -2401,7 +2732,7 @@ pub async fn handle_messages_count_tokens(
                                 "Upstream channel authentication failed",
                             );
                         }
-                        return native_response(response, None);
+                        return stored_native_response(native_err);
                     }
                 }
             }
@@ -2806,7 +3137,7 @@ async fn handle_responses_stream(
                 if !status.is_success() {
                     let body_str = resp.text().await.unwrap_or_default();
                     last_error = Some(format!("{}: {}", channel.name, body_str));
-                    match upstream_failover_decision(status.as_u16()) {
+                    match upstream_failover_decision_with_body(status.as_u16(), Some(&body_str)) {
                         FailoverDecision::Failover => continue,
                         FailoverDecision::Stop { downstream_status } => {
                             // Nothing has been streamed yet — stop cycling
@@ -3348,7 +3679,10 @@ pub async fn handle_embeddings(
                         eprintln!("[WARN] create_security_findings failed: {}", e);
                     }
                     last_error = Some(error_message);
-                    match upstream_failover_decision(status.as_u16()) {
+                    match upstream_failover_decision_with_body(
+                        status.as_u16(),
+                        Some(resp_body.to_string().as_str()),
+                    ) {
                         FailoverDecision::Failover => continue,
                         FailoverDecision::Stop { downstream_status } => {
                             // Terminal status: the same request would fail
@@ -3758,6 +4092,9 @@ pub async fn handle_health(State(shared): State<SharedState>) -> Response {
         "running": running,
         "port": port,
         "url": format!("http://127.0.0.1:{}", port),
+        // 运行版本（GAP-03）：排障与 issue 上报时核对部署版本的单一来源，
+        // 与版本号四处同步机制（package.json/Cargo.toml/tauri.conf.json）一致。
+        "version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()
 }
@@ -3765,6 +4102,95 @@ pub async fn handle_health(State(shared): State<SharedState>) -> Response {
 #[cfg(test)]
 mod anthropic_handler_tests {
     use super::*;
+
+    /// FIX-16：原生路径响应扫描构件——有界累积（超限留前缀、关闭不累积）
+    /// 与响应字节扫描并入审计。
+    #[test]
+    fn response_scan_buffer_bounds_and_feeds_merge() {
+        let mut buffer = ResponseScanBuffer {
+            buf: Vec::new(),
+            cap: 8,
+        };
+        buffer.feed(b"0123456789abcdefgh");
+        assert_eq!(buffer.buf, b"01234567", "超限只保留前缀");
+
+        let settings = security::SecuritySettings {
+            enabled: true,
+            scan_response: true,
+            ..Default::default()
+        };
+        let mut audit = security::SecurityScanResult::default();
+        scan_bytes_into(
+            &mut audit,
+            b"token sk-abcdefghijklmnopqrstuvwx123456 end",
+            &settings,
+        );
+        assert!(!audit.findings.is_empty(), "凭证必须产生响应侧发现");
+        assert_ne!(audit.risk_level, security::RiskLevel::Clean);
+
+        // cap = 0（扫描关闭）完全不累积
+        let mut off = ResponseScanBuffer {
+            buf: Vec::new(),
+            cap: 0,
+        };
+        off.feed(b"leak");
+        assert!(off.buf.is_empty(), "关闭扫描时不累积任何字节");
+    }
+
+    /// FIX-18（#15）：400 + 图片块 → message 追加诊断提示；无图片或非 400 不动。
+    #[test]
+    fn vision_hint_appended_only_for_400_with_image_blocks() {
+        let request = serde_json::json!({
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"hi"},
+                {"type":"image","source":{"type":"base64"}}
+            ]}]
+        });
+        assert!(request_has_image_blocks(&request));
+        assert!(!request_has_image_blocks(&serde_json::json!({
+            "messages": [{"role":"user","content":"plain text"}]
+        })));
+
+        let err400 = StoredNativeError {
+            status: StatusCode::BAD_REQUEST,
+            content_type: None,
+            headers: vec![],
+            body: bytes::Bytes::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"upstream rejected"}}"#,
+            ),
+        };
+        let annotated = annotate_vision_hint(err400, &request);
+        let text = String::from_utf8_lossy(&annotated.body).to_string();
+        assert!(text.contains("该渠道疑似不支持图片"), "{text}");
+        // 重复标注幂等（不叠加两遍提示）
+        let reparsed = serde_json::from_slice::<serde_json::Value>(&annotated.body).unwrap();
+        let double = annotate_vision_hint(
+            StoredNativeError {
+                status: StatusCode::BAD_REQUEST,
+                content_type: None,
+                headers: vec![],
+                body: annotated.body.clone(),
+            },
+            &request,
+        );
+        let _ = reparsed;
+        let text2 = String::from_utf8_lossy(&double.body).to_string();
+        assert_eq!(
+            text2.matches("该渠道疑似不支持图片").count(),
+            1,
+            "提示只追加一次: {text2}"
+        );
+
+        // 非 400（如 429）不追加
+        let err429 = StoredNativeError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            content_type: None,
+            headers: vec![],
+            body: bytes::Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#),
+        };
+        let untouched = annotate_vision_hint(err429, &request);
+        assert!(!String::from_utf8_lossy(&untouched.body).contains("疑似不支持"));
+    }
 
     #[test]
     fn native_forwarding_keeps_anthropic_headers_and_only_maps_model() {

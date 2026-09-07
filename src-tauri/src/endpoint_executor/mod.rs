@@ -49,11 +49,9 @@ use reqwest::header;
 use serde_json::Value;
 use std::time::Duration;
 
-/// Default idle timeout for mid-stream SSE reads (5 minutes).
-///
-/// Long enough to survive legitimate model thinking pauses, short enough
-/// to detect half-open connections and stalled upstreams.
-pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default idle timeout for mid-stream SSE reads is configurable via
+/// `StreamTimeouts`（FIX-08：`stream.idle_timeout_secs`，缺省 120s，0 = 禁用），
+/// 不再使用固定常量。
 
 /// Maximum backoff applied to a `Retry-After` value before jitter.
 const RETRY_AFTER_CAP_SECS: u64 = 5;
@@ -564,29 +562,11 @@ pub fn endpoint_path(protocol: &str, endpoint: &str) -> String {
 /// only `EndpointUnsupported` when the body proves the *path* is missing, never
 /// for a missing model.  401/403 map to `ChannelAuthTerminal` (never a local
 /// API-key error); not every `>= 400` is retried.
+///
+/// FIX-25：404 嗅探的单一事实源在 `core::attempt`（legacy 轨经
+/// `classify_http_status_with_body` 共用同一实现），此处仅委托。
 pub fn classify_upstream_status(status: u16, body: &str) -> Option<FailureClass> {
-    if status == 404 {
-        // T00 decision 5: a 404 is EndpointUnsupported ONLY when the executor
-        // proves the *path* is missing — never for a missing model (which the
-        // upstream reports as "model not found", "no such model", etc.).
-        let lower = body.to_lowercase();
-        let path_missing = lower.contains("no such endpoint")
-            || lower.contains("unknown endpoint")
-            || lower.contains("endpoint does not exist")
-            || lower.contains("path not found")
-            || lower.contains("no such path")
-            || (lower.contains("not found")
-                && !lower.contains("model")
-                && !lower.contains("model_not_found"));
-        return if path_missing {
-            Some(FailureClass::EndpointUnsupported)
-        } else {
-            // 404 with no path-not-found proof: treat as retryable/degradable,
-            // never as a caller-terminal (a missing model must not 4xx the client).
-            Some(FailureClass::Retryable)
-        };
-    }
-    classify_http_status(status)
+    crate::core::attempt::classify_http_status_with_body(status, Some(body))
 }
 
 /// Build a classified [`AttemptFailure`] from an upstream non-2xx.

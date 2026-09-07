@@ -15,7 +15,8 @@ pub(super) struct ResponsesChatState {
     tool_calls: BTreeMap<u64, ToolCallState>,
     reasoning: String,
     pub(super) usage: Usage,
-    terminal: bool,
+    /// 上游 response.completed 已消费（StreamDecoder::saw_terminal 暴露给泵，#57）。
+    pub(super) terminal: bool,
 }
 
 #[derive(Default)]
@@ -153,6 +154,13 @@ impl ResponsesChatState {
     }
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
         self.pending.extend_from_slice(bytes);
+        if sse::pending_exceeded(&self.pending) {
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                sse::pending_overflow_message(),
+            ));
+        }
         let mut output = Vec::new();
         while let Some(end) = sse::record_end(&self.pending) {
             let record: Vec<u8> = self.pending.drain(..end).collect();

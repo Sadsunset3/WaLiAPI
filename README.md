@@ -147,32 +147,39 @@ curl http://127.0.0.1:8777/health
 
 | 环境变量 | 说明 | 默认值 |
 |:---|:---|:---|
-| `WALIAPI_HOST` | 监听地址 | `0.0.0.0`（Docker）/ `127.0.0.1`（桌面） |
-| `WALIAPI_PORT` | 监听端口 | `8777` |
+| `WALIAPI_SERVER_HOST` | 监听地址 | `0.0.0.0`（Docker）/ `127.0.0.1`（桌面） |
+| `WALIAPI_SERVER_PORT` | 监听端口 | `8777` |
 | `WALIAPI_DATA_DIR` | 数据目录（SQLite + 知识库索引） | `/data` |
-| `WALIAPI_ADMIN_TOKEN` | 管理面 + KB/Wiki REST 认证令牌（≥32 字符） | 必填 |
-| `WALIAPI_MCP_TOKEN` | MCP 端点认证令牌（≥32 字符，须与 ADMIN 不同） | 必填 |
+| `WALIAPI_ADMIN_TOKEN` | KB/Wiki REST（`/api/kb`、`/api/wiki`）认证令牌（≥32 字符，Bearer） | 未配置则这些端点关闭（401） |
+| `WALIAPI_MCP_TOKEN` | MCP 端点认证令牌（≥32 字符，Bearer，须与 ADMIN 不同） | 未配置则端点关闭（401） |
 | `WALIAPI_PUBLIC_URL` | 公网访问地址（生成客户端配置时使用） | — |
-| `WALIAPI_WEB_DIR` | 前端静态资源目录 | `/app/dist` |
+
+Web 管理面板的前端静态资源已内嵌进 `waliapi-web` 二进制（rust-embed），无需单独的静态资源目录。
 
 #### 反向代理与 HTTPS
 
-Compose 默认只发布到宿主机 `127.0.0.1`，生产环境不要把端口直接暴露到公网。推荐使用 Caddy 或 Nginx 终止 HTTPS 后反代到 `127.0.0.1:8777`。Caddy 配置域名后会自动申请和续期证书，示例配置见 [`deploy/caddy/Caddyfile.example`](deploy/caddy/Caddyfile.example)。
+Compose 默认只发布到宿主机 `127.0.0.1`（可用 `WALIAPI_BIND` / `WALIAPI_PORT` 变量覆盖），生产环境不要把端口直接暴露到公网。推荐使用 Caddy 或 Nginx 终止 HTTPS 后反代到 `127.0.0.1:8777`。Caddy 配置域名后会自动申请和续期证书，示例配置见 [`deploy/caddy/Caddyfile.example`](deploy/caddy/Caddyfile.example)。
 
 #### 认证体系
 
-Web 管理面、MCP 和 `/v1` 数据面使用三个互不通用的凭证域：
+Web 管理面、服务端点（KB/Wiki/MCP）和 `/v1` 数据面使用互不通用的凭证域：
 
-- **后台管理 + KB/Wiki REST**：`WALIAPI_ADMIN_TOKEN`
-- **外部 Agent MCP**：`WALIAPI_MCP_TOKEN`（权限隔离）
-- **数据面 API**：后台创建的 `sk-waliapi-*` 密钥
+- **Web 管理面板**：管理员用户名/密码登录会话（首次启动自动生成初始密码，存于数据目录 `INITIAL_PASSWORD` 文件）
+- **KB/Wiki REST**（`/api/kb`、`/api/wiki`）：`WALIAPI_ADMIN_TOKEN`（`Authorization: Bearer <token>`；未配置则端点关闭，一律 401）
+- **外部 Agent MCP**（`/mcp`）：`WALIAPI_MCP_TOKEN`（`Authorization: Bearer <token>`，权限隔离；未配置则端点关闭）
+- **数据面 API**（`/v1/*`）：后台创建的 `sk-waliapi-*` 密钥
 
-所有管理/服务路由都不继承数据面的宽松 CORS。反向代理只负责 TLS 和转发，不得移除或绕过认证头。
+```bash
+# KB/Wiki REST 调用示例
+curl -H "Authorization: Bearer $WALIAPI_ADMIN_TOKEN" http://127.0.0.1:8777/api/kb
+```
+
+宽松 CORS 只作用于数据面 `/v1/*` 路由；KB/Wiki/MCP 服务路由与管理面板不附带跨域允许头，任意网页无法跨域读取知识资产。反向代理只负责 TLS 和转发，不得移除或绕过认证头。绑定非回环地址而缺少上述 token 时，启动日志会输出醒目告警。
 
 <details>
 <summary>📦 不使用 Docker：systemd 部署</summary>
 
-先执行 `pnpm build` 和 `cargo build --release --manifest-path src-tauri/Cargo.toml --bin waliapi-server`。将 release 二进制和前端 `dist/` 放到 `/opt/waliapi/`，创建 `waliapi` 系统用户。systemd 沙箱通过 `StateDirectory=waliapi` 创建并授权固定的数据目录 `/var/lib/waliapi`；若确需改到其他目录，必须同步修改 unit 的可写路径。
+先执行 `pnpm build` 和 `cargo build --release --manifest-path src-tauri/Cargo.toml --bin waliapi-web --no-default-features --features embed-web`。将 release 二进制和前端 `dist/` 放到 `/opt/waliapi/`，创建 `waliapi` 系统用户。systemd 沙箱通过 `StateDirectory=waliapi` 创建并授权固定的数据目录 `/var/lib/waliapi`；若确需改到其他目录，必须同步修改 unit 的可写路径。
 
 用仅 root 可读的权限安装环境文件，再填写管理员 token：
 
@@ -613,10 +620,34 @@ WaLiAPI/
 │   │   ├── channel_presets.rs        # 渠道预设注册表
 │   │   ├── lib.rs                    # 入口 + 系统托盘
 │   │   └── main.rs                   # main 函数
-│   ├── migrations/                   # 数据库迁移 (23 个)
+│   ├── migrations/                   # 数据库迁移 (27 个)
 │   └── tauri.conf.json               # Tauri 配置
 └── package.json
 ```
+
+---
+
+## 🛡️ 安全边界与威胁模型
+
+WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先阅读本节，并确认边界假设与你的部署环境一致。
+
+**凭证域（互不通用）**：
+
+| 用途 | 凭证 | 说明 |
+|:---|:---|:---|
+| 数据面 `/v1/*` | `sk-waliapi-*` 网关密钥 | 供下游客户端调用网关 |
+| Web 管理面 + KB/Wiki REST | `WALIAPI_ADMIN_TOKEN`（≥32 字符） | 首次启动生成随机管理员密码（stdout + 数据目录 `INITIAL_PASSWORD` 文件，首次登录成功后文件即删除）；登录失败限速（指数退避）、会话 Cookie 为 HttpOnly、改密后吊销全部旧会话 |
+| MCP 端点 | `WALIAPI_MCP_TOKEN`（≥32 字符，须与管理 token 不同） | Streamable HTTP + SSE |
+
+**明文密钥存储（知情声明）**：上游渠道密钥与网关 API Key 以**明文**存储在本地 SQLite 数据目录中——数据目录的文件系统权限就是安全边界，本项目不提供静态加密。渠道导出文件包含明文密钥（界面有明示警告），请仅在受控环境操作。网关密钥在管理界面仅显示掩码，复制等显式动作才按需取回全量。
+
+**安全扫描的边界（尽力而为的 DLP）**：内置风险扫描引擎（敏感信息、路径、Unicode 隐写等规则）是启发式检测，按策略支持只审计 / 警告 / 脱敏 / 阻断，定位为「尽力而为的数据泄露防护」，不构成完整的内容安全方案。响应侧扫描覆盖非流式、流式与原生 Anthropic 路径，为尽力而为语义——扫描异常不阻断响应转发；扫描预算超限按 fail-closed 拒绝请求。
+
+**CORS 作用域**：宽松 CORS（`Access-Control-Allow-Origin: *`）**仅**作用于数据面网关路由（API Key 鉴权的 `/v1/*`——跨域调用是网关的设计用法）。管理面、KB/Wiki REST 与 MCP 端点不附带宽松 CORS，浏览器跨域不可读取其响应；管理面另带 CSRF 防护（变更类请求要求 `X-Requested-With` 头）。
+
+**公网部署建议**：Docker 默认仅绑定 `127.0.0.1`；确需公网暴露时，由 Caddy/Nginx 终止 TLS 后反代，注入强 `WALIAPI_ADMIN_TOKEN` / `WALIAPI_MCP_TOKEN`，不要移除认证头；SQLite 不支持多实例写同一数据目录，保持单实例。
+
+**视觉能力路由（长期方案，#15）**：当前版本对「请求含图片块而上游渠道以 400 拒绝」的场景，在错误信息中追加**诊断提示**（该渠道疑似不支持图片），不改变路由行为（fail-open）。基于渠道能力标记（`supports_vision`）的故障转移跳过是长期方案，见 `docs/reliability-fixes-prd.md`。
 
 ---
 

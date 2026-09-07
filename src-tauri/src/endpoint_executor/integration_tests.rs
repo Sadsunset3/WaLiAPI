@@ -130,6 +130,7 @@ fn audited(
         body_len: 0,
         audit_result: SecurityScanResult::default(),
         request_features: RequestFeatures::default(),
+        security_settings: crate::security::SecuritySettings::default(),
     }
 }
 
@@ -747,6 +748,7 @@ mod auth_account {
                 "{}",
                 None,
                 service.clone(),
+                Default::default(),
             )
             .await;
             if response.status() != axum::http::StatusCode::OK {
@@ -824,6 +826,7 @@ mod auth_account {
             "{}",
             None,
             service,
+            Default::default(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

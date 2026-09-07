@@ -12,6 +12,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 仅为 Windows 测试二进制嵌入 Common-Controls v6 清单（见 build.rs），与 tauri-build 同源
+embed-resource = "3"
 
 [dependencies]
 tauri = { version = "2", features = ["test"] }
@@ -29,11 +31,13 @@ tauri-plugin-process = "2"
 # HTTP Server
 axum = "0.8"
 tokio = { version = "1", features = ["full", "test-util"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # HTTP Client
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# URL 解析与重建（KB 导入安全校验；与 reqwest 同源，不引入新版本）
+url = "2"
 futures-util = "0.3"
 async-stream = "0.3"
 
@@ -52,7 +56,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 rand = "0.9"
 dirs = "5"
@@ -104,5 +108,6 @@ embed-web = ["dep:rust-embed"]
 # （否则 waliapi_lib::run<Wry> 与路由 handler 共驻同一 CGU，wry/webkit 会被链入 NEEDED）
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# 不要设置 panic = "abort"：release 下它会让 panic 直接终止进程，
+# 代码中依赖 catch_unwind 的护栏（如知识库解析/摄入）与 tokio 任务级 panic 隔离将全部失效（issue #55）
 strip = "debuginfo"

@@ -68,6 +68,7 @@ fn full_log(channel_id: Option<&str>, channel_name: Option<&str>) -> models::Req
         blocked_reason: None,
         trace_id: Some("trace-1".into()),
         // --- T09 observability ---
+        reasoning_effort: None,
         downstream_protocol: Some("chat_completions".into()),
         downstream_endpoint: Some("chat_completions".into()),
         route_group: Some("chat_completions_g1_native".into()),
@@ -80,7 +81,6 @@ fn full_log(channel_id: Option<&str>, channel_name: Option<&str>) -> models::Req
         client_cancelled: Some(0),
         stream_committed: Some(1),
         upstream_type: "channel".into(),
-        reasoning_effort: None,
     }
 }
 

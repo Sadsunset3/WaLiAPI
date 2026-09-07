@@ -59,6 +59,13 @@ impl ChatSseState {
 
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
         self.pending.extend_from_slice(bytes);
+        if sse::pending_exceeded(&self.pending) {
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                sse::pending_overflow_message(),
+            ));
+        }
         let mut events = Vec::new();
         while let Some(end) = sse::record_end(&self.pending) {
             let record: Vec<u8> = self.pending.drain(..end).collect();
@@ -476,5 +483,8 @@ impl StreamDecoder for ChatStreamDecoder {
     }
     fn usage(&self) -> Option<Usage> {
         Some(self.state.usage)
+    }
+    fn saw_terminal(&self) -> bool {
+        self.state.saw_done
     }
 }

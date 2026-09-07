@@ -1,5 +1,5 @@
 use crate::adaptor::{get_adaptor, ProxyRequest, TokenUsage};
-use crate::core::attempt::{upstream_failover_decision, FailoverDecision};
+use crate::core::attempt::{upstream_failover_decision_with_body, FailoverDecision};
 use crate::core::dispatcher::Dispatcher;
 use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
@@ -34,21 +34,12 @@ async fn select_key_for_channel(channel: &Channel, repo: &Arc<Repository>) -> Ch
     if pool.is_empty() {
         return channel.clone();
     }
-    let total: i64 = pool.iter().map(|(_, w)| w).sum();
-    if total <= 0 {
-        return channel.clone();
-    }
-    let mut pick = rand::rng().random_range(0..total);
-    let mut chosen = &pool[0].0;
-    for (key, w) in &pool {
-        pick -= w;
-        if pick <= 0 {
-            chosen = key;
-            break;
-        }
-    }
+    // FIX-10：加权选择收敛为 core::weighted_key 单一实现（等权多 Key 均匀
+    // 分布；旧内联实现 `pick <= 0` 边界错误使第二个 Key 永远轮空，#34 根因）。
+    let chosen = crate::core::weighted_key::pick_weighted_key(&pool)
+        .unwrap_or_else(|| channel.api_key.clone());
     let mut ch = channel.clone();
-    ch.api_key = chosen.clone();
+    ch.api_key = chosen;
     ch
 }
 
@@ -274,8 +265,11 @@ pub async fn handle_request(
                     // on every other channel too, so stop cycling and answer
                     // with the decision's downstream status (an upstream
                     // 401/403 is masked to 502 — the log above keeps the
-                    // real status).
-                    match upstream_failover_decision(status) {
+                    // real status).  FIX-25：带响应体判定，404 与新轨语义一致。
+                    match upstream_failover_decision_with_body(
+                        status,
+                        Some(resp_body.to_string().as_str()),
+                    ) {
                         FailoverDecision::Failover => continue,
                         FailoverDecision::Stop { downstream_status } => {
                             return Ok(ProxyResult {
@@ -297,23 +291,15 @@ pub async fn handle_request(
                     // choices logging disabled
                 }
 
-                // Scan response for risks
-                let resp_security =
-                    security::scan_response(&resp_body, &security_settings, &custom_rules);
-                let resp_findings_count = resp_security.findings.len();
-                if resp_findings_count > 0 {
-                    // Merge response findings into request findings for logging
-                    security_result.findings.extend(resp_security.findings);
-                    if resp_security.risk_level.rank() > security_result.risk_level.rank() {
-                        security_result.risk_level = resp_security.risk_level;
-                        security_result.risk_score =
-                            security_result.risk_score.max(resp_security.risk_score);
-                        security_result.summary = format!(
-                            "{} | 响应侧: {}",
-                            security_result.summary, resp_security.summary
-                        );
-                    }
-                }
+                // Scan response for risks and merge into the request audit
+                //（FIX-16：合并语义收敛到 security::scan_response_into 单一实现；
+                // custom_rules 随上游 PR #64 贯通响应侧）
+                security::scan_response_into(
+                    &mut security_result,
+                    &resp_body,
+                    &security_settings,
+                    &custom_rules,
+                );
 
                 let (prompt_tokens, completion_tokens, total_tokens) = {
                     let (p, c, t) = (

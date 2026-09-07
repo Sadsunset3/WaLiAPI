@@ -27,6 +27,7 @@ use crate::endpoint_executor::{
     dispatch_stream_executor, next_upstream_item, StreamAttemptResult, UpstreamItem, UpstreamStream,
 };
 use crate::security::gate::AuditedRequest;
+use crate::security;
 use crate::utils;
 use axum::body::Body;
 use axum::http::{header, StatusCode};
@@ -100,22 +101,12 @@ async fn select_channel_key(channel: &Channel, repo: &Arc<Repository>) -> Channe
     if pool.is_empty() {
         return channel.clone();
     }
-    // Weighted random selection.
-    let total: i64 = pool.iter().map(|(_, w)| w).sum();
-    if total <= 0 {
-        return channel.clone();
-    }
-    let mut pick = rand::rng().random_range(0..total);
-    let mut chosen = &pool[0].0;
-    for (key, w) in &pool {
-        pick -= w;
-        if pick <= 0 {
-            chosen = key;
-            break;
-        }
-    }
+    // FIX-10：加权选择收敛为 core::weighted_key 单一实现（等权多 Key 均匀
+    // 分布；旧内联实现 `pick <= 0` 边界错误使第二个 Key 永远轮空，#34 根因）。
+    let chosen = crate::core::weighted_key::pick_weighted_key(&pool)
+        .unwrap_or_else(|| channel.api_key.clone());
     let mut ch = channel.clone();
-    ch.api_key = chosen.clone();
+    ch.api_key = chosen;
     ch
 }
 
@@ -471,6 +462,18 @@ async fn write_non_stream_log(
         None
     };
 
+    // FIX-16：响应侧扫描（尽力而为）——2xx 响应体过扫描，发现并入审计
+    // 结果后落账；扫描异常不阻断响应（scan_response 内部自降级）。
+    let mut audit_for_log = audited.audit_result.clone();
+    if execution.status >= 200 && execution.status < 300 {
+        security::scan_response_into(
+            &mut audit_for_log,
+            &execution.body,
+            &audited.security_settings,
+            &[],
+        );
+    }
+
     let log = RequestLog {
         id: utils::id::new_id(),
         seq: None,
@@ -493,12 +496,12 @@ async fn write_non_stream_log(
         created_at: utils::time::now_iso(),
         request_body: Some(sanitized_log_body.to_string()),
         response_choices,
-        risk_level: audited.audit_result.risk_level.as_str().to_string(),
-        risk_score: audited.audit_result.risk_score as i64,
-        risk_summary: Some(audited.audit_result.summary.clone()),
-        security_action: audited.audit_result.action.as_str().to_string(),
-        sanitized: i64::from(audited.audit_result.sanitized),
-        blocked_reason: audited.audit_result.blocked_reason.clone(),
+        risk_level: audit_for_log.risk_level.as_str().to_string(),
+        risk_score: audit_for_log.risk_score as i64,
+        risk_summary: Some(audit_for_log.summary.clone()),
+        security_action: audit_for_log.action.as_str().to_string(),
+        sanitized: i64::from(audit_for_log.sanitized),
+        blocked_reason: audit_for_log.blocked_reason.clone(),
         trace_id: trace_id.clone(),
         reasoning_effort: extract_reasoning_effort(&audited),
         // T09 observability fields we have on the facade path.  provider /
@@ -528,8 +531,8 @@ async fn write_non_stream_log(
     if let Err(e) = repo
         .create_security_findings(
             &log_id,
-            &audited.audit_result.findings,
-            audited.audit_result.action.as_str(),
+            &audit_for_log.findings,
+            audit_for_log.action.as_str(),
         )
         .await
     {
@@ -685,6 +688,8 @@ pub async fn route_stream_plan(
         sanitized_log_body,
         trace_id,
         auth_service,
+        // 无设置上下文的入口（测试/嵌入式调用）用缺省超时。
+        StreamTimeouts::default(),
     )
     .await
 }
@@ -700,6 +705,7 @@ pub(crate) async fn route_stream_plan_with_auth_service(
     sanitized_log_body: &str,
     trace_id: Option<String>,
     auth_service: Arc<crate::auth_provider::service::AuthService>,
+    timeouts: StreamTimeouts,
 ) -> Response {
     let lookup = candidate_lookup(&plan);
     let endpoint = plan.endpoint;
@@ -852,14 +858,32 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                     }
                     StreamAttemptResult::Connected(mut upstream) => {
                         // --- first-frame validation (commit barrier) ---
-                        let (first_frame, carry) = match buffer_first_record(&mut upstream).await {
+                        // 首帧超时（FIX-08，提交前阶段）：半死连接的首记录
+                        // 等待限时，超时按可重试失败换候选渠道。0 = 禁用。
+                        let first_frame_result = if timeouts.first_frame.is_zero() {
+                            buffer_first_record(&mut upstream).await
+                        } else {
+                            match tokio::time::timeout(
+                                timeouts.first_frame,
+                                buffer_first_record(&mut upstream),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(format!(
+                                    "first frame timed out after {:?} waiting for a valid SSE record",
+                                    timeouts.first_frame
+                                )),
+                            }
+                        };
+                        let (first_frame, carry) = match first_frame_result {
                             Ok(x) => x,
                             Err(diagnostic) => {
-                                // Empty / undecodable upstream: pre-commit failover.
+                                // Empty / timed-out / undecodable upstream: pre-commit failover.
                                 // The diagnostic suffix (bytes received + sanitized
-                                // preview) keeps the stable message prefix intact for
-                                // `affects_mode_health` while making the audit log
-                                // reveal WHAT the upstream actually sent.
+                                // preview, or the FIX-08 timeout note) keeps the stable
+                                // message prefix intact for `affects_mode_health` while
+                                // making the audit log reveal WHAT actually happened.
                                 let failure = AttemptFailure {
                                     failure_class: FailureClass::UpstreamProtocolError,
                                     message: format!(
@@ -1026,7 +1050,7 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                             upstream_protocol,
                             upstream_endpoint,
                             upstream_type,
-                            super::STREAM_IDLE_TIMEOUT,
+                            timeouts,
                         );
                         let mut builder = Response::builder()
                             .status(StatusCode::OK)
@@ -1174,6 +1198,38 @@ async fn buffer_first_record(
 /// client disconnects mid-stream the async-stream is dropped, this guard's
 /// `Drop` runs, and a spawned task records a `client_cancelled` log.  The
 /// `client_cancelled` marker is therefore written exactly once per request.
+/// 流式落账快照：生成器在每帧后更新，客户端中途取消（Drop 路径）时
+/// finalizer 读取——取消行记录已产生的真实用量与响应内容，而不是硬编码
+/// 零值（issue #57：取消/断开导致已产生的计费数据整体丢失）。
+#[derive(Default, Clone)]
+struct StreamSnapshot {
+    /// (prompt, completion, total, cached)，每帧更新。
+    usage: (i64, i64, i64, i64),
+    /// 已累积的响应文本（终止时或内容显著增长时重建，控制 O(n) 复制成本）。
+    content: String,
+    /// 终止后构建的完整 response_choices JSON。
+    response_choices: Option<String>,
+    terminal: bool,
+}
+
+/// 每帧后同步落账快照：用量恒新；响应内容/choices 首个非空内容立即快照
+/// （短流取消时才有正文可折算 completion），之后仅在协议终止或内容较上次
+/// 快照增长 ≥16KB 时重建——每帧重建会把流式复制放大成 O(n²)。
+fn update_stream_snapshot(snapshot: &std::sync::Arc<std::sync::Mutex<StreamSnapshot>>, pump: &StreamPumpCore) {
+    let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    s.usage = pump.usage();
+    let content = pump.accumulated_content();
+    let grew = content.len().saturating_sub(s.content.len());
+    if pump.terminated() {
+        s.terminal = true;
+        s.content = content.to_string();
+        s.response_choices = pump.build_response_choices();
+    } else if s.content.is_empty() || grew >= 16 * 1024 {
+        s.content = content.to_string();
+        s.response_choices = pump.build_response_choices();
+    }
+}
+
 #[derive(Clone)]
 struct StreamLogFinalizer {
     repo: Arc<Repository>,
@@ -1196,64 +1252,11 @@ struct StreamLogFinalizer {
     upstream_type: String,
     started: Instant,
     completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 生成器随流推进发布到这里的进度。客户端中途断开时 `Drop` 只能看到这份
-    /// 快照，用它把断开前已经产生的 token 用量补记进 499 行（此前恒为 0）。
-    progress: std::sync::Arc<std::sync::Mutex<Option<StreamCancelProgress>>>,
-}
-
-/// 客户端断开前已经观测到的流式进度，用于 499 行的用量补记。
-#[derive(Clone, Default)]
-struct StreamCancelProgress {
-    /// 上游已回传的 usage（prompt, completion, total, cached）。
-    usage: (i64, i64, i64, i64),
-    /// 已下发给下游的正文；上游没回传 usage 时用它做本地估算。
-    content: String,
+    /// 与流泵共享的落账快照（issue #57）：取消路径读取，见 [`StreamSnapshot`]。
+    snapshot: std::sync::Arc<std::sync::Mutex<StreamSnapshot>>,
 }
 
 impl StreamLogFinalizer {
-    /// 把当前进度发布给 finalizer。只在真正要向下游 yield 字节时调用，因此
-    /// 「有进度」等价于「响应已经开始交付」。
-    fn publish_progress(&self, pump: &StreamPumpCore) {
-        let usage = pump.usage();
-        let content = pump.accumulated_content().to_string();
-        if let Ok(mut slot) = self.progress.lock() {
-            let p = slot.get_or_insert_with(StreamCancelProgress::default);
-            p.usage = usage;
-            p.content = content;
-        }
-    }
-
-    /// 客户端断开：状态仍是 499 + client_cancelled，但用量按断开前已观测到的数据
-    /// 补记（上游回传优先，否则用已下发正文本地估算）。一个字节都没发出去时保持全 0
-    /// —— 那次请求上游可能根本没开始生成。
-    async fn write_cancelled(&self, progress: Option<StreamCancelProgress>) {
-        let mut usage = (0i64, 0i64, 0i64, 0i64);
-        if let Some(p) = progress.as_ref() {
-            usage = p.usage;
-            if usage.0 == 0 && usage.1 == 0 && usage.2 == 0 {
-                let req_body: serde_json::Value = serde_json::from_str(&self.sanitized_log_body)
-                    .unwrap_or(serde_json::Value::Null);
-                let (prompt, completion, total) = super::estimate_usage::estimate_usage(
-                    &req_body,
-                    Some(p.content.as_str()),
-                    &self.model,
-                );
-                usage = (prompt, completion, total, 0);
-            }
-        }
-        self.write(
-            true,
-            false,
-            Some("client_cancelled"),
-            usage.0,
-            usage.1,
-            usage.2,
-            usage.3,
-            None,
-        )
-        .await;
-    }
-
     async fn write(
         &self,
         client_cancelled: bool,
@@ -1265,6 +1268,22 @@ impl StreamLogFinalizer {
         usage_cached: i64,
         response_choices: Option<String>,
     ) {
+        // FIX-16：响应侧扫描（尽力而为）——扫描流泵累积的响应文本，发现
+        // 并入审计结果后落账。取消/中断行同样覆盖：半程内容同样有泄露面。
+        // 快照内容在协议终止或每增长 ≥16KB 时刷新，扫描到最近一次快照为止。
+        let snapshot_content = {
+            let snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            snap.content.clone()
+        };
+        let mut audit_for_log = self.audited.audit_result.clone();
+        if !snapshot_content.is_empty() {
+            security::scan_response_into(
+                &mut audit_for_log,
+                &json!({ "content": snapshot_content }),
+                &self.audited.security_settings,
+                &[],
+            );
+        }
         let duration_ms = self.started.elapsed().as_millis() as i64;
         let log = RequestLog {
             id: utils::id::new_id(),
@@ -1296,12 +1315,12 @@ impl StreamLogFinalizer {
             created_at: utils::time::now_iso(),
             request_body: Some(self.sanitized_log_body.clone()),
             response_choices,
-            risk_level: self.audited.audit_result.risk_level.as_str().to_string(),
-            risk_score: self.audited.audit_result.risk_score as i64,
-            risk_summary: Some(self.audited.audit_result.summary.clone()),
-            security_action: self.audited.audit_result.action.as_str().to_string(),
-            sanitized: i64::from(self.audited.audit_result.sanitized),
-            blocked_reason: self.audited.audit_result.blocked_reason.clone(),
+            risk_level: audit_for_log.risk_level.as_str().to_string(),
+            risk_score: audit_for_log.risk_score as i64,
+            risk_summary: Some(audit_for_log.summary.clone()),
+            security_action: audit_for_log.action.as_str().to_string(),
+            sanitized: i64::from(audit_for_log.sanitized),
+            blocked_reason: audit_for_log.blocked_reason.clone(),
             trace_id: self.trace_id.clone(),
             reasoning_effort: extract_reasoning_effort(&self.audited),
             // T09 observability fields (single source: PreparedAttempt + identity).
@@ -1332,8 +1351,8 @@ impl StreamLogFinalizer {
             .repo
             .create_security_findings(
                 &log_id,
-                &self.audited.audit_result.findings,
-                self.audited.audit_result.action.as_str(),
+                &audit_for_log.findings,
+                audit_for_log.action.as_str(),
             )
             .await
         {
@@ -1359,14 +1378,73 @@ impl Drop for StreamLogFinalizer {
         // `completed == false` and spawns ANOTHER task, recursively — an
         // unbounded chain of duplicate 499 rows (and eventual stack overflow /
         // process abort).  Setting the flag first makes the write exactly-once.
+        //
+        // #57: the cancelled row keeps what the stream already produced —
+        // the pump snapshot's real usage (fallback: local estimate) and the
+        // accumulated response so far — instead of hardcoded zeros.
         if !self.completed.load(std::sync::atomic::Ordering::SeqCst) {
             self.completed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let f = self.clone();
-            let progress = f.progress.lock().ok().and_then(|g| g.clone());
-            tokio::spawn(async move {
-                f.write_cancelled(progress).await;
-            });
+            // FIX-26：Drop 可能在 runtime 已关停（应用退出中）时执行，
+            // 裸 tokio::spawn 会 panic；守卫后优雅跳过该条落账。
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { write_cancelled_row(&f).await });
+            }
+        }
+    }
+}
+
+/// 取消行的实际写入（从 Drop 中拆出便于复用与测试）。
+async fn write_cancelled_row(f: &StreamLogFinalizer) {
+    let snap = f
+        .snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let (mut p, mut c, mut t, cached) = snap.usage;
+    let choices = snap.response_choices;
+    // 兜底：上游未回报 usage 时按请求体 + 已收到内容本地估算，
+    // 取消行的计费统计不再恒为 0。
+    if t == 0 && p == 0 && c == 0 {
+        let req_body: serde_json::Value =
+            serde_json::from_str(&f.sanitized_log_body).unwrap_or(serde_json::Value::Null);
+        let (ep, ec, et) =
+            super::estimate_usage::estimate_usage(&req_body, Some(snap.content.as_str()), &f.model);
+        p = ep;
+        c = ec;
+        t = et;
+    }
+    f.write(true, false, Some("client_cancelled"), p, c, t, cached, choices)
+        .await;
+}
+
+/// 流式超时配置（FIX-08）：首帧等待与帧间空闲分别限时，0 表示禁用该项。
+/// 缺省 60s/120s，可经设置 `stream.first_frame_timeout_secs` /
+/// `stream.idle_timeout_secs` 覆盖（SettingsStore 任意键读取，无需 schema）。
+#[derive(Debug, Clone, Copy)]
+pub struct StreamTimeouts {
+    pub first_frame: std::time::Duration,
+    pub idle: std::time::Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            first_frame: std::time::Duration::from_secs(60),
+            idle: std::time::Duration::from_secs(120),
+        }
+    }
+}
+
+impl StreamTimeouts {
+    pub fn from_settings(settings: &crate::settings_store::SettingsStore) -> Self {
+        let secs = |key: &str, default: u64| {
+            std::time::Duration::from_secs(settings.get_u64(key, default))
+        };
+        Self {
+            first_frame: secs("stream.first_frame_timeout_secs", 60),
+            idle: secs("stream.idle_timeout_secs", 120),
         }
     }
 }
@@ -1394,9 +1472,10 @@ fn stream_response_body(
     upstream_protocol: String,
     upstream_endpoint: String,
     upstream_type: String,
-    idle_timeout: Duration,
+    timeouts: StreamTimeouts,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let mode_for_error = mode.clone();
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(StreamSnapshot::default()));
     let finalizer = StreamLogFinalizer {
         repo,
         key,
@@ -1418,7 +1497,7 @@ fn stream_response_body(
         upstream_type,
         started: Instant::now(),
         completed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        progress: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        snapshot: snapshot.clone(),
     };
     let completed = finalizer.completed.clone();
 
@@ -1437,6 +1516,10 @@ fn stream_response_body(
         // bytes, never raw upstream bytes.  Native passthrough preserves raw.
         match pump.start() {
             Ok(first) => {
+                // 极短响应：首帧/伴随帧（carry）就含全部内容甚至终止标记，
+                // 此时 while 循环一次都不进——这里同步一次落账快照，
+                // 否则取消行丢内容、FIX-16 响应扫描拿到空快照。
+                update_stream_snapshot(&snapshot, &pump);
                 if !first.is_empty() {
                     if !finalized && downstream_terminal_frame(&mode_for_error, &first) {
                         finalized = true;
@@ -1448,8 +1531,6 @@ fn stream_response_body(
                             StreamLogSnapshot::take(&pump),
                         )
                         .await;
-                    } else {
-                        finalizer.publish_progress(&pump);
                     }
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from(first));
                 }
@@ -1460,10 +1541,34 @@ fn stream_response_body(
             }
         }
 
-        while !had_error {
-            match next_upstream_item(&mut upstream_bytes, idle_timeout).await {
-                UpstreamItem::Chunk(Some(Ok(bytes))) => match pump.push(&bytes) {
+        // 协议终止事件已到即视为流完成（#57）：不等上游 TCP EOF——部分上游
+        // （如 ModelScope）发完数据后延迟关连接，期间客户端断开会把本已
+        // 成功的调用记成 499 零用量行。终止后跳出循环走正常落账路径。
+        // 首帧/伴随帧就含终止标记（极短响应）的情形由 pump 内部登记覆盖。
+        while !had_error && !pump.terminated() {
+            // 帧间空闲超时（FIX-08，提交后阶段）：上游挂死时不再无限等待，
+            // 超时按流错误收尾（下发结构化错误事件 + 502 落账）。0 = 禁用。
+            let next = if timeouts.idle.is_zero() {
+                upstream_bytes.next().await
+            } else {
+                match next_upstream_item(&mut upstream_bytes, timeouts.idle).await {
+                    UpstreamItem::Chunk(item) => item,
+                    UpstreamItem::IdleTimeout => {
+                        pump.mark_idle_timeout();
+                        had_error = true;
+                        error_message = Some(format!(
+                            "upstream idle timeout: no frame for {:?}",
+                            timeouts.idle
+                        ));
+                        break;
+                    }
+                }
+            };
+            match next {
+                Some(Ok(bytes)) => match pump.push(&bytes) {
                     Ok(out) => {
+                        // 每帧后同步取消路径要用的落账快照（#57）。
+                        update_stream_snapshot(&snapshot, &pump);
                         if !out.is_empty() {
                             if !finalized && downstream_terminal_frame(&mode_for_error, &out) {
                                 finalized = true;
@@ -1475,8 +1580,6 @@ fn stream_response_body(
                                     StreamLogSnapshot::take(&pump),
                                 )
                                 .await;
-                            } else {
-                                finalizer.publish_progress(&pump);
                             }
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from(out));
                         }
@@ -1487,7 +1590,7 @@ fn stream_response_body(
                         break;
                     }
                 },
-                UpstreamItem::Chunk(Some(Err(e))) => {
+                Some(Err(e)) => {
                     had_error = true;
                     // The upstream body failed mid-stream.  `error decoding
                     // response body` (reqwest Kind::Decode) hides the real cause
@@ -1501,15 +1604,7 @@ fn stream_response_body(
                     ));
                     break;
                 }
-                UpstreamItem::Chunk(None) => break,
-                UpstreamItem::IdleTimeout => {
-                    had_error = true;
-                    error_message = Some(format!(
-                        "stream idle timeout: no upstream data for {}s (mid-stream stall)",
-                        idle_timeout.as_secs()
-                    ));
-                    break;
-                }
+                None => break,
             }
         }
 
@@ -1517,6 +1612,8 @@ fn stream_response_body(
         if !had_error {
             match pump.finish() {
                 Ok(out) => {
+                    // 终止收尾后再同步一次快照：finish 可能补齐终止标记内容。
+                    update_stream_snapshot(&snapshot, &pump);
                     if !out.is_empty() {
                         if !finalized && downstream_terminal_frame(&mode_for_error, &out) {
                             finalized = true;
@@ -1528,8 +1625,6 @@ fn stream_response_body(
                                 StreamLogSnapshot::take(&pump),
                             )
                             .await;
-                        } else {
-                            finalizer.publish_progress(&pump);
                         }
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(out));
                     }
@@ -1694,22 +1789,32 @@ fn error_chain_root(err: &dyn std::error::Error) -> String {
 /// Format a post-commit stream error event in the DOWNSTREAM protocol (I-2).
 /// `mode` is the downstream mode ("chat" / "anthropic" / "responses" /
 /// "embedding" / "anthropic_count_tokens"), NOT the SSE transform mode.
-fn format_stream_error(mode: &str, message: &str) -> String {
-    let msg = message.replace('"', "\\\"");
+///
+/// FIX-20：data 载荷一律经 serde_json 构造——错误消息含引号/换行/反斜杠时
+/// 手写转义拼接会产生非法 JSON 帧导致 SDK 断流。
+pub(crate) fn format_stream_error(mode: &str, message: &str) -> String {
     if mode == "responses" {
         format!(
-            "event: response.failed\ndata: {{\"type\":\"response.failed\",\"error\":{{\"message\":\"{}\"}}}}\n\n",
-            msg
+            "event: response.failed\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "response.failed",
+                "error": {"message": message}
+            })
         )
     } else if mode == "anthropic" || mode == "anthropic_count_tokens" {
         format!(
-            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{}\"}}}}\n\n",
-            msg
+            "event: error\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": message}
+            })
         )
     } else {
         format!(
-            "data: {{\"error\":{{\"message\":\"{}\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
-            msg
+            "data: {}\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "error": {"message": message, "type": "server_error"}
+            })
         )
     }
 }
@@ -1890,7 +1995,10 @@ mod tests {
             "messages".to_string(),
             "channel".to_string(),
             // Very short idle timeout for testing.
-            Duration::from_millis(50),
+            StreamTimeouts {
+                first_frame: Duration::ZERO,
+                idle: Duration::from_millis(50),
+            },
         );
 
         let mut bytes = Vec::new();
@@ -2102,6 +2210,34 @@ mod tests {
         assert!(!format_stream_error("chat", "x").contains("chat_to_messages_v1"));
     }
 
+    /// FIX-20：错误消息含引号/换行/反斜杠时 data 帧必须是合法 JSON
+    /// （手写转义拼接会产生断流帧）。三种下游协议逐一断言可解析。
+    #[test]
+    fn stream_error_events_are_always_valid_json() {
+        for mode in ["chat", "anthropic", "responses"] {
+            let event = format_stream_error(mode, "quote \" backslash \\ newline \n tab \t");
+            for line in event.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    if payload == "[DONE]" {
+                        continue;
+                    }
+                    let parsed: serde_json::Value = serde_json::from_str(payload)
+                        .unwrap_or_else(|e| panic!("{mode}: invalid JSON frame {payload:?}: {e}"));
+                    // 消息原样往返（合法转义，不丢失字符）。
+                    let msg = if mode == "responses" {
+                        parsed.pointer("/error/message")
+                    } else {
+                        parsed.pointer("/error/message")
+                    };
+                    assert_eq!(
+                        msg.and_then(|m| m.as_str()),
+                        Some("quote \" backslash \\ newline \n tab \t")
+                    );
+                }
+            }
+        }
+    }
+
     /// The root-cause walk must surface the innermost error even when a generic
     /// transport message (reqwest `Kind::Decode`) wraps it.
     #[test]
@@ -2208,6 +2344,7 @@ mod tests {
             body_len: 0,
             audit_result: SecurityScanResult::default(),
             request_features: RequestFeatures::default(),
+            security_settings: crate::security::SecuritySettings::default(),
         }
     }
 
@@ -2293,7 +2430,7 @@ mod tests {
             "anthropic".to_string(),
             "messages".to_string(),
             "channel".to_string(),
-            crate::endpoint_executor::STREAM_IDLE_TIMEOUT,
+            StreamTimeouts::default(),
         );
 
         let mut bytes = Vec::new();
@@ -2310,5 +2447,428 @@ mod tests {
             text.contains("\"content\":\"carried\""),
             "the carry record must be decoded and emitted by stream_response_body: {text}"
         );
+    }
+
+    // ─── #57：流式落账语义（终止早退 / 取消保留用量） ─────────────────────
+
+    /// 构造「首记录 + 内容/用量块 + 终止标记，随后挂死」的上游体：
+    /// 协议终止事件之后上游流永远不结束（模拟 ModelScope 发完数据延迟关
+    /// 连接甚至不关连接的行为），用于验证终止早退。
+    fn hanging_after_terminal_upstream(
+        with_stop: bool,
+        with_usage: bool,
+    ) -> UpstreamStream {
+        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n",
+        ))];
+        let mut second = String::new();
+        second.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n");
+        if with_usage {
+            second.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n");
+        }
+        if with_stop {
+            second.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        }
+        chunks.push(Ok(bytes::Bytes::from(second)));
+        let body = futures_util::stream::iter(chunks)
+            .chain(futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>())
+            .boxed();
+        UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        }
+    }
+
+    async fn pump_for(upstream: &mut UpstreamStream) -> StreamPumpCore {
+        let (first_frame, carry) = buffer_first_record(upstream).await.unwrap();
+        let mut sup = crate::core::stream_supervisor::StreamSupervisor::new();
+        sup.begin_connect().unwrap();
+        sup.on_upstream_headers().unwrap();
+        sup.on_first_frame_validated().unwrap();
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
+        StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry).unwrap()
+    }
+
+    fn full_request_body() -> String {
+        serde_json::json!({
+            "model": "m",
+            "messages": [{"role":"user","content":"请帮我总结这段足够长的提示词内容，确保本地 token 估算明显大于零，用于验证取消路径的兜底估算逻辑。"}]
+        })
+        .to_string()
+    }
+
+    // ─── FIX-16：响应侧扫描接入主路径（可观察测试） ────────────────────────
+
+    fn audited_request_with_response_scan() -> AuditedRequest {
+        let mut audited = audited_request();
+        audited.security_settings = crate::security::SecuritySettings {
+            enabled: true,
+            scan_response: true,
+            ..Default::default()
+        };
+        audited
+    }
+
+    /// 非流式 facade：响应体含凭证 → 落账行风险升级、摘要拼「响应侧」、
+    /// response 阶段发现入库。
+    #[tokio::test]
+    async fn non_stream_response_scan_records_findings() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let audited = audited_request_with_response_scan();
+        let execution = crate::core::plan_executor::PlanExecution {
+            status: 200,
+            body: json!({
+                "choices": [{"message": {"role": "assistant",
+                    "content": "token sk-abcdefghijklmnopqrstuvwx123456 end"}}]
+            }),
+            usage: None,
+            channel_id: Some("ch-1".into()),
+            channel_name: Some("ch".into()),
+            upstream_type: Some("channel".into()),
+            route_group: Some("chat_g1_native".into()),
+            upstream_protocol: Some("openai".into()),
+            upstream_endpoint: Some("chat_completions".into()),
+            upstream_model: Some("up-model".into()),
+            provider: Some("openai".into()),
+            identity_revision: Some(1),
+            codec_version: None,
+            response_headers: vec![],
+            attempts: 1,
+            duration_ms: 5,
+            last_failure: None,
+        };
+        write_non_stream_log(&repo, &api_key(), &audited, "chat", &execution, 5, "{}", None).await;
+
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        let row = &logs[0];
+        assert_ne!(
+            row.risk_level, "clean",
+            "响应凭证必须升级风险等级: {}",
+            row.risk_level
+        );
+        assert!(
+            row.risk_summary.as_deref().unwrap_or("").contains("响应侧"),
+            "summary: {:?}",
+            row.risk_summary
+        );
+        let findings = repo.get_security_findings(&row.id).await.unwrap();
+        assert!(
+            findings.iter().any(|f| f.phase == "response"),
+            "response 发现必须入库: {findings:?}"
+        );
+    }
+
+    /// 流式 facade：累积内容含凭证 → 完成行的审计同样并入响应侧发现。
+    #[tokio::test]
+    async fn stream_response_scan_records_findings() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let secret_delta = "leak sk-abcdefghijklmnopqrstuvwx123456 now";
+        let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(
+            format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{secret_delta}\"}}}}\n\n\
+                 event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+        ))])
+        .boxed();
+        let mut upstream = UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        };
+        let pump = pump_for(&mut upstream).await;
+
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request_with_response_scan(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        );
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            bytes.extend_from_slice(&item.unwrap());
+        }
+
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        let row = &logs[0];
+        assert_eq!(row.status_code, 200);
+        assert_ne!(
+            row.risk_level, "clean",
+            "流式响应凭证必须升级风险等级: {}",
+            row.risk_level
+        );
+        let findings = repo.get_security_findings(&row.id).await.unwrap();
+        assert!(
+            findings.iter().any(|f| f.phase == "response"),
+            "response 发现必须入库: {findings:?}"
+        );
+    }
+
+    /// #57 主场景：协议终止事件已到、上游不关连接（EOF 永远不来）时，
+    /// 流必须正常完成并落 200 行（带真实 usage 与响应内容），而不是挂到
+    /// 客户端超时取消再落 499 零用量行。
+    #[tokio::test]
+    async fn stream_completes_on_protocol_terminal_without_upstream_eof() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = hanging_after_terminal_upstream(true, true);
+        let pump = pump_for(&mut upstream).await;
+
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        );
+
+        // 上游挂死时若实现退化回「等 EOF」，这里 10s 超时直接失败。
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        let consumed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                while let Some(item) = stream.next().await {
+                    bytes.extend_from_slice(&item.unwrap());
+                }
+            },
+        )
+        .await;
+        assert!(consumed.is_ok(), "stream must complete on protocol terminal without upstream EOF");
+
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1, "exactly one row after terminal completion");
+        let row = &logs[0];
+        assert_eq!(row.status_code, 200, "protocol-complete stream is a success, not 499: {row:?}");
+        assert_eq!(row.completion_tokens, 5, "upstream-reported usage must be recorded");
+        assert!(row.client_cancelled.unwrap_or(0) == 0);
+        let choices = row.response_choices.as_deref().unwrap_or_default();
+        assert!(choices.contains("hi"), "accumulated content must be recorded: {choices}");
+    }
+
+    /// #57 取消路径：客户端中途断开（流被 drop）时，499 行记录流泵快照里
+    /// 已解析的真实 usage，而不是硬编码 0。
+    #[tokio::test]
+    async fn client_cancel_records_pump_usage_snapshot() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        // 无 message_stop：流未终止，客户端在收到第二帧输出后断开。
+        let mut upstream = hanging_after_terminal_upstream(false, true);
+        let pump = pump_for(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+
+        // 消费两帧输出（首帧 + 含 usage 的第二帧），确保快照已更新。
+        stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(!second.is_empty());
+
+        // 客户端断开：drop 生成器 → finalizer Drop → 后台写 499 行。
+        drop(stream);
+
+        // Drop 的 spawn 是异步任务，轮询等待 499 行出现（上限 5s）。
+        let mut row = None;
+        for _ in 0..100 {
+            let logs = repo.get_logs(10, 0).await.unwrap();
+            if let Some(first) = logs.first() {
+                row = Some(first.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let row = row.expect("499 row must be written after client cancel");
+        assert_eq!(row.status_code, 499);
+        assert_eq!(row.client_cancelled.unwrap_or(0), 1);
+        assert_eq!(
+            row.completion_tokens, 5,
+            "cancelled row must keep the pump snapshot usage, not zeros"
+        );
+    }
+
+    /// #57 兜底：上游从未回报 usage 且客户端取消时，499 行走本地估算
+    /// （请求体 + 已收内容），计费统计不恒为 0。
+    #[tokio::test]
+    async fn client_cancel_estimates_usage_when_upstream_silent() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = hanging_after_terminal_upstream(false, false);
+        let pump = pump_for(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+
+        stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(!second.is_empty());
+        drop(stream);
+
+        let mut row = None;
+        for _ in 0..100 {
+            let logs = repo.get_logs(10, 0).await.unwrap();
+            if let Some(first) = logs.first() {
+                row = Some(first.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let row = row.expect("499 row must be written after client cancel");
+        assert_eq!(row.status_code, 499);
+        assert!(
+            row.total_tokens > 0,
+            "cancelled row must fall back to a local usage estimate: {row:?}"
+        );
+    }
+
+    /// FIX-08：帧间空闲超时——上游挂死（发帧后既无终止标记也关连接）时，
+    /// 流在 idle 超时后以结构化错误事件收尾并落 502 行，不再无限等待。
+    #[tokio::test]
+    async fn stream_idle_timeout_ends_hung_upstream_with_error_event() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        // 无 message_stop、无 EOF：第二帧输出后上游永久挂起。
+        let mut upstream = hanging_after_terminal_upstream(false, false);
+        let pump = pump_for(&mut upstream).await;
+
+        let timeouts = StreamTimeouts {
+            first_frame: std::time::Duration::from_secs(30),
+            idle: std::time::Duration::from_millis(300),
+        };
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            timeouts,
+        );
+
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                while let Some(item) = stream.next().await {
+                    bytes.extend_from_slice(&item.unwrap());
+                }
+            },
+        )
+        .await;
+        assert!(finished.is_ok(), "idle timeout must end the hung stream");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("upstream idle timeout"),
+            "structured error event must carry the timeout reason: {text}"
+        );
+
+        // 提交后超时 = 流错误：落 502 行（非 499、非成功 200）。
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 502, "idle timeout is a stream error: {logs:?}");
+    }
+
+    /// FIX-08：StreamTimeouts 缺省值——首帧 60s、空闲 120s。
+    #[test]
+    fn stream_timeouts_defaults_are_sane() {
+        let t = StreamTimeouts::default();
+        assert_eq!(t.first_frame, std::time::Duration::from_secs(60));
+        assert_eq!(t.idle, std::time::Duration::from_secs(120));
     }
 }

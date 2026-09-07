@@ -3,6 +3,8 @@ import { logApi } from "../lib/api";
 import type { RequestLog, SecurityFinding } from "../types";
 import { formatTime, formatDuration, formatNumber } from "../lib/constants";
 import { writeClipboard } from "../lib/runtime";
+import { safeJsonParse } from "../lib/json";
+import { unescapeText } from "../lib/text";
 import {
   ScrollText, RefreshCw, Trash2, ChevronDown, ChevronRight, AlertCircle,
   Bot, User, Wrench, Terminal, Eye, FileCode2, Image, ArrowRightLeft, ArrowUp, ArrowDown, ArrowDownLeft, ArrowUpRight, Shield, Timer, Coins,
@@ -90,6 +92,30 @@ function formatArguments(args?: string): string {
   }
 }
 
+/**
+ * 消息 content 字段转可展示字符串：undefined/null → ""；数组（Anthropic 内容块）按块拼接文本；
+ * 其余类型 JSON 序列化。防止 undefined 调 .replace 或数组被当作字符串断言导致渲染崩溃。
+ */
+function contentToString(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content === undefined || content === null) return "";
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => {
+        if (block && typeof block === "object" && !Array.isArray(block)) {
+          const b = block as Record<string, unknown>;
+          if (typeof b.text === "string" && b.text) return b.text;
+          if (typeof b.type === "string") return `[${b.type}]`;
+          return "";
+        }
+        return String(block);
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return JSON.stringify(content) ?? "";
+}
+
 /** Get a short preview of message content */
 function getContentPreview(msg: Record<string, unknown>, maxLen: number = 140): string {
   const content = msg.content;
@@ -128,7 +154,8 @@ function getContentPreview(msg: Record<string, unknown>, maxLen: number = 140): 
   }
   if (msg.tool_calls) return `🔧 ${extractToolNames(msg).join(", ")}`;
   if (msg.function_call) return `🔧 ${(msg.function_call as Record<string, unknown>).name as string}`;
-  const str = JSON.stringify(content);
+  // content 为 undefined 时 JSON.stringify 返回 undefined，需兜底为空串
+  const str = JSON.stringify(content) ?? "";
   const compacted = str.replace(/\n+/g, " ").trim();
   return compacted.length > maxLen ? compacted.slice(0, maxLen) + "…" : compacted;
 }
@@ -178,8 +205,13 @@ export function LogsPage() {
 
   const hasActiveFilters = keyword || filterApiKey || filterChannel || filterModel || filterDateFrom || filterDateTo || filterTraceId || filterUpstreamType;
 
+  // 请求序号：过滤条件快速变化时只接受最新一次请求的响应，
+  // 乱序返回的陈旧数据不得覆盖新数据（FIX-15/NEW-2 统一模式）。
+  const loadSeq = useRef(0);
+
   const load = useCallback((p: number = 0, silent: boolean = false) => {
     if (!silent) setLoading(true);
+    const seq = ++loadSeq.current;
     logApi.getAll({
       limit: PAGE_SIZE,
       offset: p * PAGE_SIZE,
@@ -195,27 +227,43 @@ export function LogsPage() {
       trace_id: filterTraceId || undefined,
       upstream_type: filterUpstreamType || undefined,
     })
-      .then(setLogs)
-      .catch(() => setLoadError(true))
-      .finally(() => { if (!silent) setLoading(false); });
+      .then(items => { if (seq === loadSeq.current) setLogs(items); })
+      .catch(() => { if (seq === loadSeq.current) setLoadError(true); })
+      .finally(() => { if (!silent && seq === loadSeq.current) setLoading(false); });
   }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId, filterUpstreamType]);
 
-  useEffect(() => { load(0); }, [load]);
+  // 过滤条件变化防抖 300ms 再重载（FIX-15：此前每个按键直接触发请求）。
+  useEffect(() => {
+    const timer = setTimeout(() => load(0), 300);
+    return () => clearTimeout(timer);
+  }, [load]);
 
   // ─── Auto-refresh: poll every 5s when page is visible ───────────────────
-  // Silently refreshes the current page so new logs appear without
-  // triggering the loading spinner or disrupting the user's view.
+  // 默认开启保持既有语义，可关闭（偏好持久化，GAP-06，上游 #28 的跟进）。
+  // 有日志行展开时不做静默轮询——新日志会把旧行顶出当前页导致详情
+  // 悄然收起；正在阅读的详情优先（GAP-06）。
+  const [autoRefresh, setAutoRefresh] = useState(() => localStorage.getItem("waliapi:logs-auto-refresh") !== "off");
   const pageRef = useRef(page);
   pageRef.current = page;
+  const expandedIdRef = useRef(expandedId);
+  expandedIdRef.current = expandedId;
+
+  const toggleAutoRefresh = () => {
+    setAutoRefresh(prev => {
+      localStorage.setItem("waliapi:logs-auto-refresh", prev ? "off" : "on");
+      return !prev;
+    });
+  };
 
   useEffect(() => {
+    if (!autoRefresh) return;
     const interval = setInterval(() => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState === "visible" && expandedIdRef.current === null) {
         load(pageRef.current, true);
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [load]);
+  }, [autoRefresh, load]);
 
   const clearFilters = () => {
     setKeyword("");
@@ -274,6 +322,13 @@ export function LogsPage() {
           </button>
           <button onClick={() => setShowCleanModal(true)} className="action-secondary text-red-500">
             <Trash2 size={16} /> 清理
+          </button>
+          <button
+            onClick={toggleAutoRefresh}
+            className={`action-secondary ${autoRefresh ? "text-blue-600 bg-blue-50" : ""}`}
+            title={autoRefresh ? "自动刷新开启中（每 5 秒；展开详情或离开页面时暂停），点击关闭" : "自动刷新已关闭，点击开启"}
+          >
+            <Timer size={16} /> 自动刷新{autoRefresh ? "·开" : "·关"}
           </button>
           <button onClick={() => load(page)} disabled={loading} className="action-secondary">
             <RefreshCw size={16} className={loading ? "animate-spin" : ""} /> 刷新
@@ -1076,15 +1131,11 @@ function LogDetail({ log }: { log: RequestLog }) {
                     const fullContent = (() => {
                       const content = msg.content;
                       if (typeof content === "string") {
-                        // Convert escaped newline characters to actual newlines
-                        let processed = content
-                          .replace(/\\n/g, '\n')
-                          .replace(/\\r/g, '\r')
-                          .replace(/\\t/g, '\t');
-                        // Normalize line endings
-                        return processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                        // 还原入库时转义的换行/制表符并统一行尾
+                        return unescapeText(content);
                       }
-                      return JSON.stringify(content);
+                      // 非字符串（undefined/数组/对象）统一转可展示字符串，undefined 时为 ""
+                      return contentToString(content);
                     })();
                     const isLongContent = fullContent.length > 140;
                     const messageKey = `msg-${i}`;
@@ -1188,7 +1239,7 @@ function LogDetail({ log }: { log: RequestLog }) {
                                     type: tc.type,
                                     function: {
                                       name: tc.function?.name,
-                                      arguments: tc.function?.arguments ? (typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments) : undefined,
+                                      arguments: tc.function?.arguments ? (typeof tc.function.arguments === 'string' ? safeJsonParse(tc.function.arguments, tc.function.arguments) : tc.function.arguments) : undefined,
                                     }
                                   }, null, 2);
 
@@ -1353,8 +1404,9 @@ function LogDetail({ log }: { log: RequestLog }) {
                     const Icon = meta.icon;
                     const toolCalls = extractToolCalls(message);
 
-                    const content = (message.content as string) || "";
-                    const reasoningContent = (message.reasoning_content as string) || "";
+                    // content 可能是 undefined/数组（Anthropic 内容块），统一转字符串防止后续 .replace/.length 崩溃
+                    const content = contentToString(message.content);
+                    const reasoningContent = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
 
                     const reasoningExpanded = expandedChoices.has(`${i}-reasoning`);
                     const contentExpanded = expandedChoices.has(`${i}-content`);
@@ -1412,12 +1464,7 @@ function LogDetail({ log }: { log: RequestLog }) {
                                    onClick={async () => {
                                      const thinkingKey = `thinking-${i}`;
                                      try {
-                                       let processed = reasoningContent
-                                         .replace(/\\n/g, '\n')
-                                         .replace(/\\r/g, '\r')
-                                         .replace(/\\t/g, '\t');
-                                       processed = processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                                       await writeClipboard(processed);
+                                       await writeClipboard(unescapeText(reasoningContent));
                                        setCopyingThinkingKey(thinkingKey);
                                        setTimeout(() => setCopyingThinkingKey(null), 1000);
                                      } catch {
@@ -1455,22 +1502,10 @@ function LogDetail({ log }: { log: RequestLog }) {
                             <div className="min-w-0 text-xs text-slate-700 leading-snug whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                               {reasoningContent.length > 200 ? (
                                 reasoningExpanded ? (
-                                  (() => {
-                                    let processed = reasoningContent
-                                      .replace(/\\n/g, '\n')
-                                      .replace(/\\r/g, '\r')
-                                      .replace(/\\t/g, '\t');
-                                    return processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                                  })()
+                                  unescapeText(reasoningContent)
                                 ) : reasoningPreviewTruncated
                               ) : (
-                                (() => {
-                                  let processed = reasoningContent
-                                    .replace(/\\n/g, '\n')
-                                    .replace(/\\r/g, '\r')
-                                    .replace(/\\t/g, '\t');
-                                  return processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                                })()
+                                unescapeText(reasoningContent)
                               )}
                             </div>
                           </div>
@@ -1488,12 +1523,7 @@ function LogDetail({ log }: { log: RequestLog }) {
                                 onClick={async () => {
                                   const contentKey = `content-${i}`;
                                   try {
-                                    let processed = content
-                                      .replace(/\\n/g, '\n')
-                                      .replace(/\\r/g, '\r')
-                                      .replace(/\\t/g, '\t');
-                                    processed = processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                                    await writeClipboard(processed);
+                                    await writeClipboard(unescapeText(content));
                                     setCopyingContentKey(contentKey);
                                     setTimeout(() => setCopyingContentKey(null), 1000);
                                   } catch {
@@ -1531,22 +1561,10 @@ function LogDetail({ log }: { log: RequestLog }) {
                           <div className="min-w-0 text-xs text-slate-700 leading-snug whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                             {content.length > 300 ? (
                               contentExpanded ? (
-                                (() => {
-                                  let processed = content
-                                    .replace(/\\n/g, '\n')
-                                    .replace(/\\r/g, '\r')
-                                    .replace(/\\t/g, '\t');
-                                  return processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                                })()
+                                unescapeText(content)
                               ) : getContentPreview(message, 300)
                             ) : (
-                              (() => {
-                                let processed = content
-                                  .replace(/\\n/g, '\n')
-                                  .replace(/\\r/g, '\r')
-                                  .replace(/\\t/g, '\t');
-                                return processed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                              })()
+                              unescapeText(content)
                             )}
                           </div>
 
@@ -1563,7 +1581,7 @@ function LogDetail({ log }: { log: RequestLog }) {
                                   type: tc.type,
                                   function: {
                                     name: tc.function?.name,
-                                    arguments: tc.function?.arguments ? JSON.parse(tc.function.arguments) : undefined,
+                                    arguments: typeof tc.function?.arguments === 'string' ? safeJsonParse(tc.function.arguments, tc.function.arguments) : tc.function?.arguments,
                                   }
                                 }, null, 2);
 

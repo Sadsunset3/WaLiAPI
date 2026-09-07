@@ -60,6 +60,8 @@ pub struct AppState {
     pub test_receipts: Arc<crate::services::channel_test::TestReceiptStore>,
     /// Web 管理面板：管理员会话（内存存储，重启失效）。
     pub admin_sessions: Arc<server::admin_auth::SessionStore>,
+    /// Web 管理面板：登录失败限速（按用户/全局 + 指数退避，FIX-17）。
+    pub login_throttle: Arc<server::admin_auth::LoginThrottle>,
     /// 统一事件出口（桌面 Webview + Web SSE 桥）。
     pub events: server::event_bridge::EventSink,
     /// 设置存储（桌面 tauri-plugin-store / headless JSON 文件）。
@@ -75,9 +77,18 @@ pub fn run() {
         .map(|path| path.parent().map(|p| p.to_path_buf()).unwrap_or(std::path::PathBuf::from(".")))
         .unwrap_or(std::path::PathBuf::from("."));
 
-    // 创建日志目录
-    let log_dir = exe_dir.join("logs");
-    std::fs::create_dir_all(&log_dir).ok();
+    // 日志目录：数据目录下的 logs/（与 headless 一致、用户可写）。此前写
+    // exe 同级目录——安装模式（Program Files）下不可写，回退 stdout 后 GUI
+    // 无控制台，桌面闪退类 issue（#55/#57/#23）没有任何后端现场可查
+    // （GAP-09）。数据目录不可用时仍回退 exe 同级。
+    let data_log_dir = web_server::resolve_data_dir(None).join("logs");
+    let log_dir = if std::fs::create_dir_all(&data_log_dir).is_ok() {
+        data_log_dir
+    } else {
+        let exe_log_dir = exe_dir.join("logs");
+        std::fs::create_dir_all(&exe_log_dir).ok();
+        exe_log_dir
+    };
 
     // 按天滚动日志：文件名前缀 waliapi.log（如 waliapi.log.2026-08-25），最多保留 7 个文件
     let file_appender = tracing_appender::rolling::Builder::new()
@@ -87,8 +98,12 @@ pub fn run() {
         .build(&log_dir)
         .ok();
 
+    // 日志级别支持 RUST_LOG 环境变量（缺省 info，与既有行为一致；GAP-04），
+    // 生产排障可临时 RUST_LOG=debug 无需重编译。
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     // 统一输出到文件；构建失败时回退到标准输出
-    let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO);
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
     if let Some(file_appender) = file_appender {
         subscriber.with_writer(file_appender).init();
     } else {
@@ -203,6 +218,7 @@ pub fn run() {
                         std::time::Duration::from_secs(30 * 60),
                     )),
                     admin_sessions: server::admin_auth::SessionStore::new(),
+                    login_throttle: server::admin_auth::LoginThrottle::new(),
                     events: server::event_bridge::EventSink::desktop(
                         move |event, payload| {
                             let _ = emit_handle.emit(event, payload);
@@ -253,6 +269,7 @@ pub fn run() {
             commands::channel::toggle_channel_extra_key,
             commands::channel::delete_channel_extra_key,
             commands::api_key::get_api_keys,
+            commands::api_key::get_api_key_full,
             commands::api_key::create_api_key,
             commands::api_key::update_api_key,
             commands::api_key::delete_api_key,

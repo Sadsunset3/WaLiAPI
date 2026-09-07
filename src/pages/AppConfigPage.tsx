@@ -5,6 +5,7 @@ import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { appConfigApi, serverApi, apiKeyApi, channelApi, authApi } from "../lib/api";
 import type { AppInfo, ConfigContent } from "../lib/api";
 import type { ServerStatus, Channel, ApiKey, AuthAccount } from "../types";
+import { makeKeyGuards } from "../lib/keyRules";
 import {
   Terminal,
   Code2,
@@ -88,27 +89,17 @@ export function AppConfigPanel({ appName }: { appName: string }) {
       setAuthAccounts(acctList);
 
       // Restore persisted key selection, fallback to first key
-      const savedKey = localStorage.getItem(keyStorageKey);
-      const savedKeyValid = savedKey && keyList.some(k => k.key === savedKey);
+      // （FIX-19：密钥改存会话级；FIX-13：选择标识改用 key id）
+      const savedKey = sessionStorage.getItem(keyStorageKey);
+      const savedKeyValid = savedKey && keyList.some(k => k.id === savedKey);
       if (keyList.length > 0 && !selKey) {
-        setSelKey(savedKeyValid ? savedKey! : keyList[0].key);
+        setSelKey(savedKeyValid ? savedKey! : keyList[0].id);
       }
 
       // Restore persisted model selection, fallback to first model
       // (filtered by selected key's allowed/denied lists)
-      const selectedKeyObj = keyList.find(k => k.key === (savedKeyValid ? savedKey! : keyList[0]?.key));
-      const modelAllowed = (model: string) => {
-        if (!selectedKeyObj) return true;
-        if (selectedKeyObj.allowed_models.length > 0 && !selectedKeyObj.allowed_models.includes(model)) return false;
-        if (selectedKeyObj.denied_models.includes(model)) return false;
-        return true;
-      };
-      const channelAllowed = (chId: string) => {
-        if (!selectedKeyObj) return true;
-        if (selectedKeyObj.allowed_channels.length > 0 && !selectedKeyObj.allowed_channels.includes(chId)) return false;
-        if (selectedKeyObj.denied_channels.includes(chId)) return false;
-        return true;
-      };
+      const selectedKeyObj = keyList.find(k => k.id === (savedKeyValid ? savedKey! : keyList[0]?.id));
+      const { channelAllowed, modelAllowed } = makeKeyGuards(selectedKeyObj);
       const ms: string[] = [];
       chList.forEach(c => {
         if (!channelAllowed(c.id)) return;
@@ -139,25 +130,13 @@ export function AppConfigPanel({ appName }: { appName: string }) {
 
   // Find the currently selected API key object.
   const selectedApiKey = useMemo(
-    () => keys.find(k => k.key === selKey),
+    () => keys.find(k => k.id === selKey),
     [keys, selKey],
   );
 
   // 模型列表 — filtered by selected API key's allowed/denied lists
   const modelList = useMemo(() => {
-    const key = selectedApiKey;
-    const channelAllowed = (chId: string) => {
-      if (!key) return true;
-      if (key.allowed_channels.length > 0 && !key.allowed_channels.includes(chId)) return false;
-      if (key.denied_channels.includes(chId)) return false;
-      return true;
-    };
-    const modelAllowed = (model: string) => {
-      if (!key) return true;
-      if (key.allowed_models.length > 0 && !key.allowed_models.includes(model)) return false;
-      if (key.denied_models.includes(model)) return false;
-      return true;
-    };
+    const { channelAllowed, modelAllowed } = makeKeyGuards(selectedApiKey);
     const realSeen = new Set<string>();
     const mappedSeen = new Set<string>();
     const real: string[] = [];
@@ -205,7 +184,9 @@ export function AppConfigPanel({ appName }: { appName: string }) {
     setAppliedResult(null);
     setResultKind("apply");
     try {
-      const result = await appConfigApi.apply(appName, selKey, selModel);
+      // FIX-13：列表只回掩码，写配置前按需取完整密钥。
+      const fullKey = await apiKeyApi.getFull(selKey);
+      const result = await appConfigApi.apply(appName, fullKey, selModel);
       setAppliedResult(result);
       const [appList, content] = await Promise.all([
         appConfigApi.getApps(),
@@ -306,7 +287,8 @@ export function AppConfigPanel({ appName }: { appName: string }) {
                   未检测到
                 </span>
               )}
-              {appInfo.download_url && (
+              {/* 下载链接协议白名单（FIX-24）：配置来源不可信，只渲染 http(s)，防 javascript: 等协议注入 */}
+              {appInfo.download_url && /^https?:\/\//i.test(appInfo.download_url) && (
                 <a
                   href={appInfo.download_url}
                   target="_blank"
@@ -357,12 +339,12 @@ export function AppConfigPanel({ appName }: { appName: string }) {
                 value={selKey}
                 onChange={e => {
                   setSelKey(e.target.value);
-                  localStorage.setItem(keyStorageKey, e.target.value);
+                  sessionStorage.setItem(keyStorageKey, e.target.value);
                 }}
                 className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
               >
                 {keys.length === 0 && <option value="">请先创建密钥</option>}
-                {keys.map(k => <option key={k.id} value={k.key}>{k.name} ({k.key.slice(0, 12)}...)</option>)}
+                {keys.map(k => <option key={k.id} value={k.id}>{k.name} ({k.key})</option>)}
               </select>
               <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
             </div>

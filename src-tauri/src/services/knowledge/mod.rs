@@ -1,6 +1,7 @@
 pub mod code_parser;
 pub mod embedder;
 pub mod handlers;
+pub mod import_guard;
 pub mod importer;
 pub mod index;
 pub mod models;
@@ -12,6 +13,7 @@ pub mod repository;
 pub mod retriever;
 pub mod routes;
 pub mod splitter;
+pub mod upload;
 
 use super::{Service, ServiceStatus};
 use crate::server::router::SharedState;
