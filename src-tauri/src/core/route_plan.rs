@@ -324,7 +324,9 @@ pub struct RoutePlan {
 pub enum PlanError {
     KeyDisabled,
     KeyExpired,
-    QuotaExceeded,
+    /// 配额用尽，携带 (quota_used, quota_limit)：错误文案直接给出差额信息，
+    /// 客户端与管理端无需再查库（C-01）。
+    QuotaExceeded(i64, i64),
     ModelNotAllowed(String),
     NoChannels,
     NoCandidateForModel(String),
@@ -340,7 +342,7 @@ impl PlanError {
         match self {
             PlanError::KeyDisabled => 401,
             PlanError::KeyExpired => 401,
-            PlanError::QuotaExceeded => 429,
+            PlanError::QuotaExceeded(..) => 429,
             PlanError::ModelNotAllowed(_) => 403,
             PlanError::NoChannels => 503,
             PlanError::NoCandidateForModel(_) => 503,
@@ -360,7 +362,9 @@ impl PlanError {
         match self {
             PlanError::KeyDisabled => "API key is disabled".to_string(),
             PlanError::KeyExpired => "API key has expired".to_string(),
-            PlanError::QuotaExceeded => "Quota exceeded".to_string(),
+            PlanError::QuotaExceeded(used, limit) => {
+                format!("Quota exceeded (used {} / limit {})", used, limit)
+            }
             PlanError::ModelNotAllowed(m) => {
                 format!("Model '{}' is not allowed for this API key", m)
             }
@@ -591,7 +595,10 @@ pub fn authorize_request(api_key: &ApiKey, model: &str) -> Result<(), PlanError>
         }
     }
     if api_key.quota_limit > 0 && api_key.quota_used >= api_key.quota_limit {
-        return Err(PlanError::QuotaExceeded);
+        return Err(PlanError::QuotaExceeded(
+            api_key.quota_used,
+            api_key.quota_limit,
+        ));
     }
     let allowed: Vec<String> = serde_json::from_str(&api_key.allowed_models).unwrap_or_default();
     if !allowed.is_empty() && !allowed.iter().any(|m| m == model) {
@@ -1469,7 +1476,10 @@ mod tests {
         let mut key = api_key(&[], &[]);
         key.quota_limit = 100;
         key.quota_used = 100;
-        assert_eq!(authorize_request(&key, "m"), Err(PlanError::QuotaExceeded));
+        assert_eq!(
+            authorize_request(&key, "m"),
+            Err(PlanError::QuotaExceeded(100, 100))
+        );
     }
 
     #[test]

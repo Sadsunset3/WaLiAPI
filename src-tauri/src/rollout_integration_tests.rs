@@ -2130,7 +2130,10 @@ async fn security_quota_exceeded_zero_upstream() {
     )
     .await
     .expect_err("quota");
-    assert_eq!(err, crate::core::route_plan::PlanError::QuotaExceeded);
+    assert_eq!(
+        err,
+        crate::core::route_plan::PlanError::QuotaExceeded(100, 100)
+    );
     assert_eq!(mock.call_count().await, 0);
 }
 
