@@ -355,12 +355,15 @@ impl CodexLogin {
                 return Err(ProviderError::ImportFailed);
             }
         };
-        self.import_codex_account(CodexAccountPayload { label: None, payload })
-            .await
-            .map(|result| LoginResult {
-                last_refreshed_at: last_refresh.or(result.last_refreshed_at),
-                ..result
-            })
+        self.import_codex_account(CodexAccountPayload {
+            label: None,
+            payload,
+        })
+        .await
+        .map(|result| LoginResult {
+            last_refreshed_at: last_refresh.or(result.last_refreshed_at),
+            ..result
+        })
     }
 
     /// Shared tail of every import path: refresh an expired token, then turn
@@ -738,11 +741,13 @@ fn codex_payload_from_tokens(tokens: &Value) -> Result<ProviderPayload, Provider
 /// export.  Only `platform == "openai"` accounts whose credentials carry the
 /// full four-field token set qualify; everything else is skipped (the command
 /// layer surfaces the skip count).
-fn sub2api_codex_accounts(
-    value: &Value,
-) -> Result<Vec<CodexAccountPayload>, ProviderError> {
+fn sub2api_codex_accounts(value: &Value) -> Result<Vec<CodexAccountPayload>, ProviderError> {
     let mut accounts = Vec::new();
-    for entry in value.get("accounts").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+    for entry in value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
         if entry.get("platform").and_then(Value::as_str) != Some("openai") {
             continue;
         }
@@ -1570,7 +1575,10 @@ mod tests {
         });
         let accounts = sub2api_codex_accounts(&fixture).unwrap();
         assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].payload.as_value()["account_id"], "real-export-id");
+        assert_eq!(
+            accounts[0].payload.as_value()["account_id"],
+            "real-export-id"
+        );
         assert_eq!(
             accounts[0].label.as_deref(),
             Some("jennifersimon497104t@outlook.com_40刀")

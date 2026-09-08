@@ -80,8 +80,8 @@ impl FileSettingsBackend {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        let content = serde_json::to_string_pretty(&Value::Object(map.clone()))
-            .map_err(|e| e.to_string())?;
+        let content =
+            serde_json::to_string_pretty(&Value::Object(map.clone())).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         Ok(())

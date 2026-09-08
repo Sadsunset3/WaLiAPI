@@ -300,15 +300,7 @@ pub async fn update_page(
     let content = body.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
     let repo = WikiRepository::new(shared.state.db.pool.clone());
-    match update_page_inner(
-        &shared.state.db.pool,
-        &repo,
-        &id,
-        &path,
-        content,
-    )
-    .await
-    {
+    match update_page_inner(&shared.state.db.pool, &repo, &id, &path, content).await {
         Ok(()) => Json(serde_json::json!({ "ok": true, "path": path })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }

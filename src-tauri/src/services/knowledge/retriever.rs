@@ -1,9 +1,9 @@
 use super::index::HnswIndex;
 use super::models::SearchResult;
 use super::repository::KbRepository;
+use crate::server::event_bridge::EventSink;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use crate::server::event_bridge::EventSink;
 
 /// Default HNSW parameters
 const DEFAULT_M: usize = 16;

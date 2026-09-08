@@ -1808,7 +1808,10 @@ mod tests {
             async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
                 Err(ProviderError::ImportFailed)
             }
-            async fn refresh(&self, payload: &ProviderPayload) -> Result<RefreshedPayload, ProviderError> {
+            async fn refresh(
+                &self,
+                payload: &ProviderPayload,
+            ) -> Result<RefreshedPayload, ProviderError> {
                 let token = payload
                     .as_value()
                     .get("refresh_token")

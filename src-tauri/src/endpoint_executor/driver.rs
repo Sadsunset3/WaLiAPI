@@ -24,10 +24,11 @@ use crate::db::repository::Repository;
 use crate::endpoint_executor::sse::StreamPumpCore;
 use crate::endpoint_executor::{
     dispatch_auth_account_executor, dispatch_auth_account_stream_executor, dispatch_executor,
-    dispatch_stream_executor, next_upstream_item, StreamAttemptResult, UpstreamItem, UpstreamStream,
+    dispatch_stream_executor, next_upstream_item, StreamAttemptResult, UpstreamItem,
+    UpstreamStream,
 };
-use crate::security::gate::AuditedRequest;
 use crate::security;
+use crate::security::gate::AuditedRequest;
 use crate::utils;
 use axum::body::Body;
 use axum::http::{header, StatusCode};
@@ -71,8 +72,6 @@ fn extract_reasoning_effort(audited: &AuditedRequest) -> Option<String> {
         _ => None,
     }
 }
-
-
 
 /// Multi-key load balancing: if the channel has extra API keys in
 /// `channel_api_keys`, randomly select one weighted by `weight`. The
@@ -167,8 +166,9 @@ async fn record_channel_mode_outcome(
         }
         crate::core::attempt::AttemptResult::Failure(failure) if affects_mode_health(failure) => {
             let now = crate::utils::time::now_iso();
-            let cooldown_until = (Utc::now() + chrono::Duration::minutes(MODE_FAILURE_COOLDOWN_MINUTES))
-                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let cooldown_until = (Utc::now()
+                + chrono::Duration::minutes(MODE_FAILURE_COOLDOWN_MINUTES))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
             repo.record_channel_mode_failure(
                 channel_id,
                 endpoint,
@@ -444,16 +444,19 @@ async fn write_non_stream_log(
         }
         // OpenAI Responses API: synthesize from `output`
         else if let Some(output) = execution.body.get("output").and_then(|o| o.as_array()) {
-            let choices: Vec<serde_json::Value> = output.iter().map(|item| {
-                serde_json::json!({
-                    "index": item.get("index").unwrap_or(&serde_json::json!(0)),
-                    "message": {
-                        "role": "assistant",
-                        "content": item.get("content"),
-                    },
-                    "finish_reason": "stop",
+            let choices: Vec<serde_json::Value> = output
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "index": item.get("index").unwrap_or(&serde_json::json!(0)),
+                        "message": {
+                            "role": "assistant",
+                            "content": item.get("content"),
+                        },
+                        "finish_reason": "stop",
+                    })
                 })
-            }).collect();
+                .collect();
             serde_json::to_string(&choices).ok()
         } else {
             None
@@ -1133,9 +1136,7 @@ fn upstream_snippet(bytes: &[u8], max_bytes: usize) -> String {
 /// upstream content-type (when not SSE), and a sanitized preview of what was
 /// actually read — that the driver appends to the stable
 /// "upstream stream ended before a valid first SSE record" message prefix.
-async fn buffer_first_record(
-    upstream: &mut UpstreamStream,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
+async fn buffer_first_record(upstream: &mut UpstreamStream) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut buffer = Vec::new();
     let ct_note = if upstream
         .content_type
@@ -1215,7 +1216,10 @@ struct StreamSnapshot {
 /// 每帧后同步落账快照：用量恒新；响应内容/choices 首个非空内容立即快照
 /// （短流取消时才有正文可折算 completion），之后仅在协议终止或内容较上次
 /// 快照增长 ≥16KB 时重建——每帧重建会把流式复制放大成 O(n²)。
-fn update_stream_snapshot(snapshot: &std::sync::Arc<std::sync::Mutex<StreamSnapshot>>, pump: &StreamPumpCore) {
+fn update_stream_snapshot(
+    snapshot: &std::sync::Arc<std::sync::Mutex<StreamSnapshot>>,
+    pump: &StreamPumpCore,
+) {
     let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
     s.usage = pump.usage();
     let content = pump.accumulated_content();
@@ -1397,11 +1401,7 @@ impl Drop for StreamLogFinalizer {
 
 /// 取消行的实际写入（从 Drop 中拆出便于复用与测试）。
 async fn write_cancelled_row(f: &StreamLogFinalizer) {
-    let snap = f
-        .snapshot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let snap = f.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (mut p, mut c, mut t, cached) = snap.usage;
     let choices = snap.response_choices;
     // 兜底：上游未回报 usage 时按请求体 + 已收到内容本地估算，
@@ -1415,8 +1415,17 @@ async fn write_cancelled_row(f: &StreamLogFinalizer) {
         c = ec;
         t = et;
     }
-    f.write(true, false, Some("client_cancelled"), p, c, t, cached, choices)
-        .await;
+    f.write(
+        true,
+        false,
+        Some("client_cancelled"),
+        p,
+        c,
+        t,
+        cached,
+        choices,
+    )
+    .await;
 }
 
 /// 流式超时配置（FIX-08）：首帧等待与帧间空闲分别限时，0 表示禁用该项。
@@ -1943,9 +1952,9 @@ mod tests {
         // ending the stream.  To test idle timeout specifically, we use a
         // stream that yields one chunk then hangs (pending forever).
         let first_chunk = first_chunk.to_vec();
-        let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
-            bytes::Bytes::from(first_chunk),
-        )])
+        let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(
+            first_chunk,
+        ))])
         .chain(futures_util::stream::pending())
         .boxed();
 
@@ -1954,8 +1963,7 @@ mod tests {
             headers: vec![],
             body,
         };
-        let (first_frame, carry) =
-            buffer_first_record(&mut upstream).await.unwrap();
+        let (first_frame, carry) = buffer_first_record(&mut upstream).await.unwrap();
         assert!(carry.is_empty(), "single record, no carry");
 
         let mut sup = crate::core::stream_supervisor::StreamSupervisor::new();
@@ -2454,10 +2462,7 @@ mod tests {
     /// 构造「首记录 + 内容/用量块 + 终止标记，随后挂死」的上游体：
     /// 协议终止事件之后上游流永远不结束（模拟 ModelScope 发完数据延迟关
     /// 连接甚至不关连接的行为），用于验证终止早退。
-    fn hanging_after_terminal_upstream(
-        with_stop: bool,
-        with_usage: bool,
-    ) -> UpstreamStream {
+    fn hanging_after_terminal_upstream(with_stop: bool, with_usage: bool) -> UpstreamStream {
         let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from_static(
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n",
         ))];
@@ -2471,7 +2476,9 @@ mod tests {
         }
         chunks.push(Ok(bytes::Bytes::from(second)));
         let body = futures_util::stream::iter(chunks)
-            .chain(futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>())
+            .chain(futures_util::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >())
             .boxed();
         UpstreamStream {
             content_type: "text/event-stream".to_string(),
@@ -2544,7 +2551,17 @@ mod tests {
             duration_ms: 5,
             last_failure: None,
         };
-        write_non_stream_log(&repo, &api_key(), &audited, "chat", &execution, 5, "{}", None).await;
+        write_non_stream_log(
+            &repo,
+            &api_key(),
+            &audited,
+            "chat",
+            &execution,
+            5,
+            "{}",
+            None,
+        )
+        .await;
 
         let logs = repo.get_logs(10, 0).await.unwrap();
         assert_eq!(logs.len(), 1);
@@ -2668,25 +2685,34 @@ mod tests {
         // 上游挂死时若实现退化回「等 EOF」，这里 10s 超时直接失败。
         let mut bytes = Vec::new();
         tokio::pin!(stream);
-        let consumed = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                while let Some(item) = stream.next().await {
-                    bytes.extend_from_slice(&item.unwrap());
-                }
-            },
-        )
+        let consumed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(item) = stream.next().await {
+                bytes.extend_from_slice(&item.unwrap());
+            }
+        })
         .await;
-        assert!(consumed.is_ok(), "stream must complete on protocol terminal without upstream EOF");
+        assert!(
+            consumed.is_ok(),
+            "stream must complete on protocol terminal without upstream EOF"
+        );
 
         let logs = repo.get_logs(10, 0).await.unwrap();
         assert_eq!(logs.len(), 1, "exactly one row after terminal completion");
         let row = &logs[0];
-        assert_eq!(row.status_code, 200, "protocol-complete stream is a success, not 499: {row:?}");
-        assert_eq!(row.completion_tokens, 5, "upstream-reported usage must be recorded");
+        assert_eq!(
+            row.status_code, 200,
+            "protocol-complete stream is a success, not 499: {row:?}"
+        );
+        assert_eq!(
+            row.completion_tokens, 5,
+            "upstream-reported usage must be recorded"
+        );
         assert!(row.client_cancelled.unwrap_or(0) == 0);
         let choices = row.response_choices.as_deref().unwrap_or_default();
-        assert!(choices.contains("hi"), "accumulated content must be recorded: {choices}");
+        assert!(
+            choices.contains("hi"),
+            "accumulated content must be recorded: {choices}"
+        );
     }
 
     /// #57 取消路径：客户端中途断开（流被 drop）时，499 行记录流泵快照里
@@ -2842,14 +2868,11 @@ mod tests {
 
         let mut bytes = Vec::new();
         tokio::pin!(stream);
-        let finished = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                while let Some(item) = stream.next().await {
-                    bytes.extend_from_slice(&item.unwrap());
-                }
-            },
-        )
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                bytes.extend_from_slice(&item.unwrap());
+            }
+        })
         .await;
         assert!(finished.is_ok(), "idle timeout must end the hung stream");
         let text = String::from_utf8_lossy(&bytes);
@@ -2861,7 +2884,10 @@ mod tests {
         // 提交后超时 = 流错误：落 502 行（非 499、非成功 200）。
         let logs = repo.get_logs(10, 0).await.unwrap();
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].status_code, 502, "idle timeout is a stream error: {logs:?}");
+        assert_eq!(
+            logs[0].status_code, 502,
+            "idle timeout is a stream error: {logs:?}"
+        );
     }
 
     /// FIX-08：StreamTimeouts 缺省值——首帧 60s、空闲 120s。

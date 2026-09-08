@@ -1267,10 +1267,9 @@ mod tests {
         assert_eq!(reset["auth_mode"], "chatgpt");
         assert!(reset["OPENAI_API_KEY"].is_null());
 
-        let backup: serde_json::Value = serde_json::from_str(&fs::read_to_string(
-            dir.join("auth.json.waliapi-backup"),
+        let backup: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.join("auth.json.waliapi-backup")).unwrap(),
         )
-        .unwrap())
         .unwrap();
         assert_eq!(backup["OPENAI_API_KEY"], "sk-waliapi");
     }

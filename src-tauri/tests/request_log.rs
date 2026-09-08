@@ -208,6 +208,50 @@ async fn request_log_create_log_persists_t09_fields_and_log_dto_maps_them() {
 }
 
 #[tokio::test]
+async fn request_log_summary_reports_size_without_loading_body() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool);
+    let mut log = full_log(None, Some("summary"));
+    log.id = "summary-large".into();
+    log.request_body = Some("x".repeat(1024 * 1024));
+    repo.create_log(&log).await.expect("create_log");
+
+    let summaries = repo.get_log_summaries(20, 0).await.expect("summaries");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, log.id);
+    assert!(summaries[0].has_request_body);
+    assert_eq!(summaries[0].request_body_bytes, 1024 * 1024);
+}
+
+#[tokio::test]
+async fn request_log_basic_policy_drops_bodies_at_persistence_boundary() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool);
+    let mut log = full_log(None, Some("basic"));
+    log.id = "basic-log".into();
+    log.response_choices = Some("{\"choices\":[]}".into());
+    repo.create_log_with_policy(
+        &log,
+        waliapi_lib::audit_log::LogPolicy {
+            detail_level: waliapi_lib::audit_log::LogDetailLevel::Basic,
+            retention_days: 7,
+        },
+    )
+    .await
+    .expect("create basic log");
+
+    let stored = repo.get_log(&log.id).await.expect("get basic log");
+    assert!(stored.request_body.is_none());
+    assert!(stored.response_choices.is_none());
+    let level: String = sqlx::query_scalar("SELECT detail_level FROM request_logs WHERE id = ?")
+        .bind(&log.id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+    assert_eq!(level, "basic");
+}
+
+#[tokio::test]
 async fn request_log_upstream_type_defaults_filters_and_round_trips() {
     let pool = fresh_db().await;
     let repo = Repository::new(pool);
@@ -340,4 +384,49 @@ async fn request_log_sanitized_log_body_is_what_gets_persisted() {
     assert!(serde_json::to_string(&raw)
         .unwrap()
         .contains("abcdefghijklmnopqrstuvwx"));
+}
+
+#[tokio::test]
+async fn request_log_cleanup_removes_expired_rows_and_findings() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool.clone());
+    let mut old = full_log(None, Some("old"));
+    old.id = "old-log".into();
+    old.created_at = "2000-01-01T00:00:00Z".into();
+    repo.create_log(&old).await.expect("create old log");
+    sqlx::query(
+        "INSERT INTO request_security_findings
+         (id, log_id, phase, category, rule_id, severity, title, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("finding-old")
+    .bind(&old.id)
+    .bind("request")
+    .bind("test")
+    .bind("test-rule")
+    .bind("low")
+    .bind("test")
+    .bind("2000-01-01T00:00:00Z")
+    .execute(&pool)
+    .await
+    .expect("insert finding");
+
+    let deleted = waliapi_lib::audit_log::cleanup_expired_logs(&pool, 1)
+        .await
+        .expect("cleanup");
+    assert_eq!(deleted, 1);
+    assert!(repo.get_log(&old.id).await.is_err());
+    let findings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_security_findings WHERE log_id = ?")
+            .bind(&old.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(findings, 0);
+    assert_eq!(
+        waliapi_lib::audit_log::cleanup_expired_logs(&pool, 0)
+            .await
+            .unwrap(),
+        0
+    );
 }

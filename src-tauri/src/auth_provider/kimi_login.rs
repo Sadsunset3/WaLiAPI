@@ -421,9 +421,7 @@ impl KimiLogin {
                     });
                 }
                 Err(RefreshError::Unauthorized) => return Err(ProviderError::Unauthorized),
-                Err(RefreshError::PaymentRequired) => {
-                    return Err(ProviderError::PaymentRequired)
-                }
+                Err(RefreshError::PaymentRequired) => return Err(ProviderError::PaymentRequired),
                 Err(RefreshError::Retryable) => {
                     attempt += 1;
                     if attempt >= 3 {
@@ -624,14 +622,21 @@ mod tests {
         body: axum::body::Bytes,
     ) -> (axum::http::StatusCode, Json<Value>) {
         state.token_hits.fetch_add(1, Ordering::SeqCst);
-        state.token_times.lock().unwrap().push(std::time::Instant::now());
+        state
+            .token_times
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
         state.headers.lock().unwrap().push(headers.clone());
         state
             .seen
             .lock()
             .unwrap()
             .push(String::from_utf8_lossy(&body).to_string());
-        if state.always_pending.load(std::sync::atomic::Ordering::SeqCst) {
+        if state
+            .always_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(json!({"error": "authorization_pending"})),

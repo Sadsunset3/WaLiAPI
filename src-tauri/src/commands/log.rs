@@ -94,6 +94,73 @@ impl From<RequestLog> for LogDto {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct LogSummaryDto {
+    #[serde(flatten)]
+    pub log: LogDto,
+    pub detail_level: String,
+    pub detail_available: bool,
+    pub started_at: Option<String>,
+    pub request_body_bytes: i64,
+    pub response_choices_bytes: i64,
+}
+
+impl From<crate::db::models::RequestLogSummary> for LogSummaryDto {
+    fn from(s: crate::db::models::RequestLogSummary) -> Self {
+        let detail_available = s.detail_level == "detailed"
+            && (s.request_body_bytes > 0 || s.response_choices_bytes > 0);
+        let log = LogDto {
+            id: s.id,
+            seq: s.seq,
+            api_key_name: s.api_key_name,
+            channel_name: s.channel_name,
+            model: s.model,
+            upstream_model: s.upstream_model,
+            mode: s.mode,
+            status_code: s.status_code,
+            prompt_tokens: s.prompt_tokens,
+            completion_tokens: s.completion_tokens,
+            total_tokens: s.total_tokens,
+            cached_tokens: s.cached_tokens,
+            duration_ms: s.duration_ms,
+            error_message: s.error_message,
+            is_stream: s.is_stream == 1,
+            is_retry: s.is_retry == 1,
+            created_at: s.created_at,
+            request_body: None,
+            response_choices: None,
+            risk_level: s.risk_level,
+            risk_score: s.risk_score,
+            risk_summary: s.risk_summary,
+            security_action: s.security_action,
+            sanitized: s.sanitized == 1,
+            blocked_reason: s.blocked_reason,
+            trace_id: s.trace_id,
+            reasoning_effort: s.reasoning_effort,
+            downstream_protocol: s.downstream_protocol,
+            downstream_endpoint: s.downstream_endpoint,
+            route_group: s.route_group,
+            upstream_protocol: s.upstream_protocol,
+            upstream_endpoint: s.upstream_endpoint,
+            provider: s.provider,
+            codec_version: s.codec_version,
+            failure_class: s.failure_class,
+            identity_revision: s.identity_revision,
+            client_cancelled: s.client_cancelled.map(|v| v == 1),
+            stream_committed: s.stream_committed.map(|v| v == 1),
+            upstream_type: s.upstream_type,
+        };
+        Self {
+            log,
+            detail_level: s.detail_level,
+            detail_available,
+            started_at: s.started_at,
+            request_body_bytes: s.request_body_bytes,
+            response_choices_bytes: s.response_choices_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SecurityFindingDto {
     pub id: String,
     pub log_id: String,
@@ -146,14 +213,14 @@ pub struct GetLogsInput {
 pub async fn get_logs(
     input: GetLogsInput,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<Vec<LogDto>, String> {
+) -> Result<Vec<LogSummaryDto>, String> {
     get_logs_impl(input, &*state).await
 }
 
 pub async fn get_logs_impl(
     input: GetLogsInput,
     state: &std::sync::Arc<AppState>,
-) -> Result<Vec<LogDto>, String> {
+) -> Result<Vec<LogSummaryDto>, String> {
     let repo = Repository::new(state.db.pool.clone());
     let limit = input.limit.unwrap_or(50);
     let offset = input.offset.unwrap_or(0);
@@ -168,7 +235,7 @@ pub async fn get_logs_impl(
         || input.upstream_type.is_some();
 
     let logs = if has_search {
-        repo.search_logs_by_upstream_type(
+        repo.search_log_summaries(
             input.keyword.as_deref(),
             input.api_key_name.as_deref(),
             input.channel_name.as_deref(),
@@ -182,11 +249,11 @@ pub async fn get_logs_impl(
         )
         .await
     } else {
-        repo.get_logs(limit, offset).await
+        repo.get_log_summaries(limit, offset).await
     };
 
     logs.map_err(|e| e.to_string())
-        .map(|ls| ls.into_iter().map(Into::into).collect())
+        .map(|ls| ls.into_iter().map(LogSummaryDto::from).collect())
 }
 
 #[tauri::command]

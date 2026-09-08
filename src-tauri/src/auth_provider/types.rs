@@ -285,7 +285,9 @@ impl fmt::Debug for ProviderRequest<'_> {
 /// and never includes tokens, OAuth codes, request bodies, or auth.json bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProviderError {
-    UnknownProvider { provider: String },
+    UnknownProvider {
+        provider: String,
+    },
     InvalidPayload,
     LoginFailed,
     LoginCancelled,
@@ -301,7 +303,9 @@ pub enum ProviderError {
     /// "membership benefits").  Terminal: retrying on a maintenance cadence
     /// never fixes an inactive membership.
     PaymentRequired,
-    UnsupportedFeatures { pointer: String },
+    UnsupportedFeatures {
+        pointer: String,
+    },
     Retryable,
     Storage,
     Protocol,
@@ -358,9 +362,7 @@ impl fmt::Display for ProviderError {
             Self::AuthorizationDenied => formatter.write_str("provider authorization was denied"),
             Self::ImportFailed => formatter.write_str("provider credential import failed"),
             Self::Unauthorized => formatter.write_str("provider credentials were rejected"),
-            Self::PaymentRequired => {
-                formatter.write_str("provider subscription is not usable")
-            }
+            Self::PaymentRequired => formatter.write_str("provider subscription is not usable"),
             Self::UnsupportedFeatures { pointer } => {
                 write!(formatter, "unsupported provider request field at {pointer}")
             }

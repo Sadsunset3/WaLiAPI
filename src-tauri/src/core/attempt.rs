@@ -1545,7 +1545,10 @@ mod tests {
             );
         }
         // 非 404 与无 body 版本逐字一致（对照矩阵抽样）。
-        assert_eq!(upstream_failover_decision_with_body(400, Some("x")), stop(400));
+        assert_eq!(
+            upstream_failover_decision_with_body(400, Some("x")),
+            stop(400)
+        );
         assert_eq!(upstream_failover_decision_with_body(401, None), stop(502));
         assert_eq!(upstream_failover_decision_with_body(405, None), stop(405));
         assert_eq!(

@@ -159,7 +159,11 @@ pub fn usage_from_responses(response: &Value) -> Usage {
     let cached = response
         .pointer("/usage/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| response.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64))
+        .or_else(|| {
+            response
+                .pointer("/usage/cache_read_input_tokens")
+                .and_then(Value::as_u64)
+        })
         .unwrap_or(0);
     Usage {
         input_tokens: input.unwrap_or(0),

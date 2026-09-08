@@ -34,7 +34,9 @@ fn blocking_client_map() -> &'static Mutex<HashMap<u64, reqwest::Client>> {
 /// 兜底客户端并打日志（与旧行为一致，但只告警一次桶）。
 pub fn blocking_client(timeout_secs: u64) -> reqwest::Client {
     let key = timeout_secs.max(1);
-    let mut buckets = blocking_client_map().lock().unwrap_or_else(|e| e.into_inner());
+    let mut buckets = blocking_client_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(client) = buckets.get(&key) {
         return client.clone();
     }
@@ -88,21 +90,33 @@ mod client_reuse_tests {
     #[test]
     fn blocking_clients_are_bucketed_by_timeout() {
         let before = {
-            let map = blocking_client_map().lock().unwrap_or_else(|e| e.into_inner());
+            let map = blocking_client_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(!map.contains_key(&12345) && !map.contains_key(&12346));
             map.len()
         };
         let _a = blocking_client(12345);
         let _b = blocking_client(12345);
         {
-            let map = blocking_client_map().lock().unwrap_or_else(|e| e.into_inner());
+            let map = blocking_client_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(map.contains_key(&12345), "bucket must be cached");
-            assert!(map.len() >= before + 1, "same timeout must share one bucket");
+            assert!(
+                map.len() >= before + 1,
+                "same timeout must share one bucket"
+            );
         }
         let _c = blocking_client(12346);
         {
-            let map = blocking_client_map().lock().unwrap_or_else(|e| e.into_inner());
-            assert!(map.contains_key(&12346), "second timeout must get its own bucket");
+            let map = blocking_client_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                map.contains_key(&12346),
+                "second timeout must get its own bucket"
+            );
             assert!(map.len() >= before + 2);
         }
     }
@@ -111,8 +125,13 @@ mod client_reuse_tests {
     #[test]
     fn blocking_client_normalizes_timeout_key() {
         let _a = blocking_client(0);
-        let map = blocking_client_map().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(map.contains_key(&1), "timeout 0 must normalize to the 1s bucket");
+        let map = blocking_client_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map.contains_key(&1),
+            "timeout 0 must normalize to the 1s bucket"
+        );
     }
 }
 

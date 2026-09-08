@@ -191,8 +191,8 @@ pub async fn save_wiki_page(
             "[]",
         )
         .await;
-    let _ =
-        crate::services::wiki::project::append_log(&project_id, &format!("update | {}", path)).await;
+    let _ = crate::services::wiki::project::append_log(&project_id, &format!("update | {}", path))
+        .await;
     Ok(())
 }
 

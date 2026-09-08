@@ -265,9 +265,16 @@ data: {"type":"response.function_call_arguments.done","output_index":0,"item_id"
 
     // delta 事件本身不应该出现在下游输出里——不下发任何参数内容
     for line in output.lines() {
-        let Some(rest) = line.strip_prefix("data: ") else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) else { continue };
-        if let Some(tcs) = v.pointer("/choices/0/delta/tool_calls").and_then(|t| t.as_array()) {
+        let Some(rest) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) else {
+            continue;
+        };
+        if let Some(tcs) = v
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(|t| t.as_array())
+        {
             for tc in tcs {
                 if let Some(a) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
                     assert_eq!(
@@ -284,7 +291,11 @@ data: {"type":"response.function_call_arguments.done","output_index":0,"item_id"
         1,
         "id 应恰好出现一次"
     );
-    assert_eq!(output.matches("Shanghai").count(), 1, "完整参数应恰好发送一次");
+    assert_eq!(
+        output.matches("Shanghai").count(),
+        1,
+        "完整参数应恰好发送一次"
+    );
 }
 
 #[test]

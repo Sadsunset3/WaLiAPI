@@ -36,10 +36,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn pool(entries: &[(&str, i64)]) -> Vec<(String, i64)> {
-        entries
-            .iter()
-            .map(|(k, w)| (k.to_string(), *w))
-            .collect()
+        entries.iter().map(|(k, w)| (k.to_string(), *w)).collect()
     }
 
     /// 等权两 Key 的分布回归（#34 根因）：修复前第二个 Key 命中率为 0。

@@ -34,7 +34,9 @@ pub fn resolve_data_dir(explicit: Option<String>) -> PathBuf {
         }
     }
     // 与 tauri app_data_dir 对齐：$XDG_DATA_HOME/<identifier>（Docker 中即 /data/<identifier>）
-    let base = std::env::var("XDG_DATA_HOME").ok().filter(|v| !v.trim().is_empty());
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     if let Some(base) = base {
         return PathBuf::from(base).join(crate::APP_IDENTIFIER);
     }
@@ -62,7 +64,11 @@ fn platform_default_data_dir() -> PathBuf {
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn platform_default_data_dir() -> PathBuf {
     std::env::var("HOME")
-        .map(|v| PathBuf::from(v).join(".local/share").join(crate::APP_IDENTIFIER))
+        .map(|v| {
+            PathBuf::from(v)
+                .join(".local/share")
+                .join(crate::APP_IDENTIFIER)
+        })
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
@@ -102,11 +108,17 @@ pub async fn run(cfg: WebServerConfig) -> Result<(), String> {
         admin_sessions: server::admin_auth::SessionStore::new(),
         login_throttle: server::admin_auth::LoginThrottle::new(),
         events: server::event_bridge::EventSink::headless(event_tx),
-        settings: settings_store::SettingsStore::file(
-            settings_store::default_settings_path(&data_dir),
-        ),
+        settings: settings_store::SettingsStore::file(settings_store::default_settings_path(
+            &data_dir,
+        )),
         data_dir,
     });
+
+    crate::audit_log::apply_settings(&state.settings);
+    tauri::async_runtime::spawn(crate::audit_log::run_maintenance_loop(
+        state.db.pool.clone(),
+        state.settings.clone(),
+    ));
 
     tauri::async_runtime::spawn(crate::auth_provider::maintenance::run_maintenance_loop(
         auth_service,

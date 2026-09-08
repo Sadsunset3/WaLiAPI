@@ -185,6 +185,8 @@ function getRoleMeta(role: string) {
 
 export function LogsPage() {
   const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [details, setDetails] = useState<Record<string, RequestLog>>({});
+  const [detailLoadingId, setDetailLoadingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [page, setPage] = useState(0);
@@ -281,8 +283,31 @@ export function LogsPage() {
     try {
       await logApi.delete(id);
       setLogs(prev => prev.filter(l => l.id !== id));
+      setDetails(prev => { const next = { ...prev }; delete next[id]; return next; });
+      if (expandedId === id) setExpandedId(null);
     } catch (e) {
       console.error("Failed to delete log:", e);
+    }
+  };
+
+  const handleToggleLog = async (id: string) => {
+    if (expandedId === id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(id);
+    if (details[id]) return;
+    const summary = logs.find(log => log.id === id);
+    // 基本模式明确没有正文时无需再请求详情接口；展开直接展示说明。
+    if (summary?.detail_available === false || (summary?.detail_level === "basic" && !summary.request_body)) return;
+    setDetailLoadingId(id);
+    try {
+      const detail = await logApi.get(id);
+      setDetails(prev => ({ ...prev, [id]: detail }));
+    } catch (e) {
+      console.error("Failed to load log detail:", e);
+    } finally {
+      setDetailLoadingId(current => current === id ? null : current);
     }
   };
 
@@ -452,7 +477,12 @@ export function LogsPage() {
       {/* Table area — fills remaining height, scrolls internally */}
       <div className="flex-1 overflow-hidden px-7 pb-7 min-h-0">
         <div className="surface h-full overflow-hidden rounded-[24px] flex flex-col">
-          {logs.length === 0 ? (
+          {loading && logs.length === 0 ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
+              <RefreshCw className="h-10 w-10 animate-spin text-muted-foreground/60" />
+              <p className="text-base font-medium">正在加载审计日志…</p>
+            </div>
+          ) : logs.length === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
               {loadError ? (
                 <>
@@ -506,7 +536,9 @@ export function LogsPage() {
                         key={log.id}
                         log={log}
                         expanded={expandedId === log.id}
-                        onToggle={() => setExpandedId(expandedId === log.id ? null : log.id)}
+                        detail={details[log.id]}
+                        detailLoading={detailLoadingId === log.id}
+                        onToggle={() => handleToggleLog(log.id)}
                         onDelete={() => handleDeleteLog(log.id)}
                         showTraceColumn={showTraceColumn}
                       />
@@ -552,12 +584,16 @@ export function LogsPage() {
 
 function LogRow({
   log,
+  detail,
+  detailLoading,
   expanded,
   onToggle,
   onDelete,
   showTraceColumn,
 }: {
   log: RequestLog;
+  detail?: RequestLog;
+  detailLoading: boolean;
   expanded: boolean;
   onToggle: () => void;
   onDelete: () => void;
@@ -650,7 +686,21 @@ function LogRow({
         <tr>
           <td colSpan={13} className="px-4 py-4 bg-slate-50/80 border-b border-border align-top">
             <div className="min-w-0 max-w-full overflow-hidden">
-              <LogDetail log={log} />
+              {detailLoading ? (
+                <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+                  <RefreshCw size={15} className="animate-spin" /> 正在加载日志详情…
+                </div>
+              ) : detail ? (
+                <LogDetail log={detail} />
+              ) : log.detail_available === false || (!log.request_body && log.detail_level === "basic") ? (
+                <div className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+                  该记录使用“基本”日志级别，未保存请求与响应正文；网络状态、渠道、模型、推理档位、响应码和 Token 等摘要信息仍可查看。
+                </div>
+              ) : (
+                <div className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                  日志详情暂时不可用，请稍后重试。
+                </div>
+              )}
             </div>
           </td>
         </tr>

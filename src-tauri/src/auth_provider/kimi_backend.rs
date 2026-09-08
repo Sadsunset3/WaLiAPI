@@ -429,7 +429,10 @@ mod tests {
             .route(
                 "/coding/v1/chat/completions",
                 post(
-                    move |State(s): State<MockState>, uri: axum::extract::OriginalUri, h: HeaderMap, body: axum::body::Bytes| {
+                    move |State(s): State<MockState>,
+                          uri: axum::extract::OriginalUri,
+                          h: HeaderMap,
+                          body: axum::body::Bytes| {
                         let s = s.clone();
                         async move {
                             s.chat_hits.fetch_add(1, Ordering::SeqCst);
@@ -447,7 +450,10 @@ mod tests {
             .route(
                 "/coding/v1/messages",
                 post(
-                    move |State(s): State<MockState>, uri: axum::extract::OriginalUri, h: HeaderMap, body: axum::body::Bytes| {
+                    move |State(s): State<MockState>,
+                          uri: axum::extract::OriginalUri,
+                          h: HeaderMap,
+                          body: axum::body::Bytes| {
                         let s = s.clone();
                         async move {
                             s.messages_hits.fetch_add(1, Ordering::SeqCst);
@@ -464,26 +470,23 @@ mod tests {
             )
             .route(
                 "/coding/v1/models",
-                get(
-                    move |State(s): State<MockState>, h: HeaderMap| async move {
-                        s.chat_headers.lock().unwrap().push(h.clone());
-                        s.uris.lock().unwrap().push(
-                            axum::http::Uri::from_static("/coding/v1/models"),
-                        );
-                        let status = s
-                            .models_status
-                            .load(std::sync::atomic::Ordering::SeqCst);
-                        if status != 0 {
-                            return (
-                                axum::http::StatusCode::from_u16(status as u16).unwrap(),
-                                Json(json!({"error": "upstream"})),
-                            )
-                                .into_response();
-                        }
-                        let body = s.models_response.lock().unwrap().clone();
-                        (axum::http::StatusCode::OK, Json(body)).into_response()
-                    },
-                ),
+                get(move |State(s): State<MockState>, h: HeaderMap| async move {
+                    s.chat_headers.lock().unwrap().push(h.clone());
+                    s.uris
+                        .lock()
+                        .unwrap()
+                        .push(axum::http::Uri::from_static("/coding/v1/models"));
+                    let status = s.models_status.load(std::sync::atomic::Ordering::SeqCst);
+                    if status != 0 {
+                        return (
+                            axum::http::StatusCode::from_u16(status as u16).unwrap(),
+                            Json(json!({"error": "upstream"})),
+                        )
+                            .into_response();
+                    }
+                    let body = s.models_response.lock().unwrap().clone();
+                    (axum::http::StatusCode::OK, Json(body)).into_response()
+                }),
             )
             .route(
                 "/oauth/device",
@@ -633,10 +636,7 @@ mod tests {
                 {"id": "weird", "protocol": "nope"}
             ]
         });
-        let models = provider
-            .list_models(&account(), &payload())
-            .await
-            .unwrap();
+        let models = provider.list_models(&account(), &payload()).await.unwrap();
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["kimi-k2.5", "kimi-k2.5-anthropic", "weird"]);
         // The weird protocol is fail-closed as unavailable, never routed.
@@ -646,7 +646,10 @@ mod tests {
         assert_eq!(uri.path(), "/coding/v1/models");
         let h = &state.chat_headers.lock().unwrap()[0];
         assert_eq!(
-            h.get(reqwest::header::AUTHORIZATION).unwrap().to_str().unwrap(),
+            h.get(reqwest::header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer tok"
         );
         assert_eq!(
@@ -662,7 +665,10 @@ mod tests {
             .models_status
             .store(401, std::sync::atomic::Ordering::SeqCst);
         let result = provider.list_models(&account(), &payload()).await;
-        assert!(matches!(result, Err(crate::auth_provider::ProviderError::Unauthorized)));
+        assert!(matches!(
+            result,
+            Err(crate::auth_provider::ProviderError::Unauthorized)
+        ));
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 mod adaptor;
+pub mod audit_log;
 #[cfg(test)]
 mod auth_integration_tests;
 pub mod auth_provider;
@@ -12,8 +13,8 @@ mod protocol;
 mod rollout_integration_tests;
 pub mod security;
 pub mod server;
-pub mod settings_store;
 pub mod services;
+pub mod settings_store;
 pub mod utils;
 pub mod web_server;
 
@@ -74,7 +75,11 @@ pub struct AppState {
 pub fn run() {
     // 获取可执行文件所在目录
     let exe_dir = std::env::current_exe()
-        .map(|path| path.parent().map(|p| p.to_path_buf()).unwrap_or(std::path::PathBuf::from(".")))
+        .map(|path| {
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(std::path::PathBuf::from("."))
+        })
         .unwrap_or(std::path::PathBuf::from("."));
 
     // 日志目录：数据目录下的 logs/（与 headless 一致、用户可写）。此前写
@@ -203,9 +208,8 @@ pub fn run() {
                     Arc::new(db::repository::Repository::new(db.pool.clone())),
                     auth_provider::ProviderRegistry::new(),
                 ));
-                let (event_tx, _) = tokio::sync::broadcast::channel(
-                    server::event_bridge::EVENT_CHANNEL_CAPACITY,
-                );
+                let (event_tx, _) =
+                    tokio::sync::broadcast::channel(server::event_bridge::EVENT_CHANNEL_CAPACITY);
                 let emit_handle = app_handle.clone();
                 let state = Arc::new(AppState {
                     db,
@@ -231,6 +235,12 @@ pub fn run() {
                     data_dir,
                 });
                 app_handle.manage(state.clone());
+
+                crate::audit_log::apply_settings(&state.settings);
+                tauri::async_runtime::spawn(crate::audit_log::run_maintenance_loop(
+                    state.db.pool.clone(),
+                    state.settings.clone(),
+                ));
 
                 tauri::async_runtime::spawn(async move {
                     auth_provider::maintenance::run_maintenance_loop(auth_service).await;
@@ -413,6 +423,11 @@ fn should_close_to_tray(app: &tauri::AppHandle) -> bool {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }

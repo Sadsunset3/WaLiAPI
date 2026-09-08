@@ -52,7 +52,8 @@ impl SessionStore {
                 *last = Instant::now();
             }
         }
-        self.inner.insert(token, (session, Instant::now() + SESSION_TTL));
+        self.inner
+            .insert(token, (session, Instant::now() + SESSION_TTL));
     }
 
     pub fn get(&self, token: &str) -> Option<AdminSession> {
@@ -72,7 +73,8 @@ impl SessionStore {
 
     /// 吊销某用户的全部会话（FIX-17：改密后旧会话一律失效）。
     pub fn revoke_all_for_user(&self, user_id: &str) {
-        self.inner.retain(|_, (session, _)| session.user_id != user_id);
+        self.inner
+            .retain(|_, (session, _)| session.user_id != user_id);
     }
 
     /// 清扫全部过期会话（FIX-17：不依赖逐条 get 才惰性删除）。
@@ -142,12 +144,18 @@ impl LoginThrottle {
             Some(e) if now.duration_since(e.last_failure) <= FAIL_MEMORY => e.failures + 1,
             _ => 1,
         };
-        self.inner
-            .insert(key.to_string(), FailEntry { failures: next, last_failure: now });
+        self.inner.insert(
+            key.to_string(),
+            FailEntry {
+                failures: next,
+                last_failure: now,
+            },
+        );
         // 顺带修剪长期无活动的条目，防随机用户名撑爆计数表。
         if let Ok(mut last) = self.last_prune.lock() {
             if last.elapsed() >= FAIL_MEMORY {
-                self.inner.retain(|_, e| now.duration_since(e.last_failure) <= FAIL_MEMORY);
+                self.inner
+                    .retain(|_, e| now.duration_since(e.last_failure) <= FAIL_MEMORY);
                 *last = now;
             }
         }
@@ -236,7 +244,11 @@ pub async fn find_user_by_username(
     }))
 }
 
-pub async fn update_password(pool: &SqlitePool, user_id: &str, new_password: &str) -> Result<(), String> {
+pub async fn update_password(
+    pool: &SqlitePool,
+    user_id: &str,
+    new_password: &str,
+) -> Result<(), String> {
     let hash = hash_password(new_password)?;
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query("UPDATE admin_users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
@@ -249,7 +261,11 @@ pub async fn update_password(pool: &SqlitePool, user_id: &str, new_password: &st
     Ok(())
 }
 
-pub async fn update_username(pool: &SqlitePool, user_id: &str, new_username: &str) -> Result<(), String> {
+pub async fn update_username(
+    pool: &SqlitePool,
+    user_id: &str,
+    new_username: &str,
+) -> Result<(), String> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query("UPDATE admin_users SET username = ?, updated_at = ? WHERE id = ?")
         .bind(new_username)
@@ -263,7 +279,10 @@ pub async fn update_username(pool: &SqlitePool, user_id: &str, new_username: &st
 
 /// 首次启动时若无 admin 用户，创建 admin + 随机 16 位密码并写入 INITIAL_PASSWORD 文件。
 /// `data_dir` 为应用数据目录（容器内 /data/<identifier>）。
-pub async fn ensure_initial_admin(pool: &SqlitePool, data_dir: &std::path::Path) -> Result<(), String> {
+pub async fn ensure_initial_admin(
+    pool: &SqlitePool,
+    data_dir: &std::path::Path,
+) -> Result<(), String> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users")
         .fetch_one(pool)
         .await
@@ -302,7 +321,10 @@ pub async fn ensure_initial_admin(pool: &SqlitePool, data_dir: &std::path::Path)
         log::warn!("创建数据目录失败: {e}");
     }
     let file = data_dir.join("INITIAL_PASSWORD");
-    if let Err(e) = std::fs::write(&file, format!("username: {username}\npassword: {password}\n")) {
+    if let Err(e) = std::fs::write(
+        &file,
+        format!("username: {username}\npassword: {password}\n"),
+    ) {
         log::warn!("写入 INITIAL_PASSWORD 失败: {e}");
     } else {
         log::info!("初始密码已写入 {}", file.display());
@@ -396,7 +418,10 @@ mod tests {
         }
         assert_eq!(throttle.penalty_remaining("alice", t0), Duration::ZERO);
         assert_eq!(throttle.penalty_remaining("dave", t0), Duration::ZERO);
-        assert_eq!(throttle.penalty_remaining(LOGIN_GLOBAL_KEY, t0), Duration::ZERO);
+        assert_eq!(
+            throttle.penalty_remaining(LOGIN_GLOBAL_KEY, t0),
+            Duration::ZERO
+        );
     }
 
     #[test]

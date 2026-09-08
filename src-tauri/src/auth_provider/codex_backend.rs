@@ -449,8 +449,7 @@ fn usage_window(value: Option<&Value>) -> Option<QuotaWindow> {
         .map(|time| time.to_rfc3339());
     // Same `has_data` rule as the header parser: an all-empty window must not
     // manufacture an empty bar.
-    let has_data =
-        used_percent != 0.0 || window_minutes != 0 || reset_at.is_some();
+    let has_data = used_percent != 0.0 || window_minutes != 0 || reset_at.is_some();
     has_data.then(|| QuotaWindow {
         used_percent: Some(used_percent),
         window_minutes: Some(window_minutes),

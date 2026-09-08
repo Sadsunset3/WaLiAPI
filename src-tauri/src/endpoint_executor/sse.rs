@@ -41,7 +41,8 @@ pub fn parse_data_payload(record: &[u8]) -> Result<String, String> {
 /// 标记，防止故障/恶意上游把内存与日志体积放大到失控。下游转发不受影响
 /// （转发的字节不经过累积），仅影响落库的 response_choices。
 pub(crate) const MAX_ACCUMULATED_CONTENT_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const ACCUMULATION_TRUNCATION_MARKER: &str = "\n\n[... WaLiAPI: accumulated content truncated ...]";
+pub(crate) const ACCUMULATION_TRUNCATION_MARKER: &str =
+    "\n\n[... WaLiAPI: accumulated content truncated ...]";
 
 /// Validate only enough framing to retain the pre-commit failover barrier.
 /// Full protocol validation belongs to the decoder factory selected at prepare
@@ -137,7 +138,14 @@ impl StreamPumpCore {
             })?;
             for event in &events {
                 output.extend_from_slice(event.as_bytes());
-                accumulate_from_sse_event(event, &mut accumulated_content, &mut accumulated_reasoning, &mut response_role, &mut finish_reason, &mut tool_calls_map);
+                accumulate_from_sse_event(
+                    event,
+                    &mut accumulated_content,
+                    &mut accumulated_reasoning,
+                    &mut response_role,
+                    &mut finish_reason,
+                    &mut tool_calls_map,
+                );
                 terminal_registered |= sse_event_is_terminal(event);
             }
         }
@@ -203,7 +211,9 @@ impl StreamPumpCore {
 
     /// 帧间空闲超时观测（FIX-08）：记录到流监督状态机供诊断，不改变泵状态。
     pub fn mark_idle_timeout(&mut self) {
-        let _ = self.supervisor.on_timeout(crate::core::stream_supervisor::StreamTimeoutKind::StreamIdle);
+        let _ = self
+            .supervisor
+            .on_timeout(crate::core::stream_supervisor::StreamTimeoutKind::StreamIdle);
     }
 
     pub fn finish(&mut self) -> Result<Vec<u8>, PumpError> {
@@ -255,7 +265,8 @@ impl StreamPumpCore {
         if !self.accumulation_truncated
             && self.accumulated_content.len() >= MAX_ACCUMULATED_CONTENT_BYTES
         {
-            self.accumulated_content.push_str(ACCUMULATION_TRUNCATION_MARKER);
+            self.accumulated_content
+                .push_str(ACCUMULATION_TRUNCATION_MARKER);
             self.accumulation_truncated = true;
         }
         if self.accumulation_truncated {
@@ -342,19 +353,13 @@ fn accumulate_from_sse_event(
         if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
                 // role (usually on the first delta)
-                if let Some(r) = choice
-                    .pointer("/delta/role")
-                    .and_then(|r| r.as_str())
-                {
+                if let Some(r) = choice.pointer("/delta/role").and_then(|r| r.as_str()) {
                     if role.is_none() {
                         *role = Some(r.to_string());
                     }
                 }
                 // content
-                if let Some(c) = choice
-                    .pointer("/delta/content")
-                    .and_then(|c| c.as_str())
-                {
+                if let Some(c) = choice.pointer("/delta/content").and_then(|c| c.as_str()) {
                     content.push_str(c);
                 }
                 // reasoning_content (DeepSeek / OpenAI o-series)
@@ -370,10 +375,7 @@ fn accumulate_from_sse_event(
                     .and_then(|tc| tc.as_array())
                 {
                     for tc in tcs {
-                        let idx = tc
-                            .get("index")
-                            .and_then(|i| i.as_i64())
-                            .unwrap_or(0);
+                        let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
                         let entry = tool_calls_map
                             .entry(idx)
                             .or_insert_with(|| serde_json::json!({"index": idx, "id": null, "type": "function", "function": {"name": "", "arguments": ""}}));
@@ -383,9 +385,15 @@ fn accumulate_from_sse_event(
                         if let Some(t) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
                             entry["function"]["name"] = serde_json::json!(t);
                         }
-                        if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
-                            if let Some(existing) = entry.pointer("/function/arguments").and_then(|a| a.as_str()) {
-                                entry["function"]["arguments"] = serde_json::json!(format!("{existing}{args}"));
+                        if let Some(args) =
+                            tc.pointer("/function/arguments").and_then(|a| a.as_str())
+                        {
+                            if let Some(existing) = entry
+                                .pointer("/function/arguments")
+                                .and_then(|a| a.as_str())
+                            {
+                                entry["function"]["arguments"] =
+                                    serde_json::json!(format!("{existing}{args}"));
                             } else {
                                 entry["function"]["arguments"] = serde_json::json!(args);
                             }
@@ -414,7 +422,9 @@ fn accumulate_from_sse_event(
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             let idx = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
                             // Use a hash of the id as the key for tool calls
-                            let key = idx.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+                            let key = idx
+                                .bytes()
+                                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
                             tool_calls_map.insert(key, serde_json::json!({
                                 "index": key,
                                 "id": idx,
@@ -441,8 +451,13 @@ fn accumulate_from_sse_event(
                                 // Append to the most recent tool call's arguments
                                 if let Some((&_k, _)) = tool_calls_map.last_key_value() {
                                     if let Some(entry) = tool_calls_map.get_mut(&_k) {
-                                        let existing = entry.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("").to_string();
-                                        entry["function"]["arguments"] = serde_json::json!(format!("{existing}{pj}"));
+                                        let existing = entry
+                                            .pointer("/function/arguments")
+                                            .and_then(|a| a.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        entry["function"]["arguments"] =
+                                            serde_json::json!(format!("{existing}{pj}"));
                                     }
                                 }
                             }
@@ -709,7 +724,15 @@ mod tests {
         assert!(error.message().contains("bad upstream event"));
     }
 
-    fn accumulate(event: &str) -> (String, String, Option<String>, Option<String>, std::collections::BTreeMap<i64, serde_json::Value>) {
+    fn accumulate(
+        event: &str,
+    ) -> (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        std::collections::BTreeMap<i64, serde_json::Value>,
+    ) {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut role = None;
@@ -731,12 +754,10 @@ mod tests {
     /// `response_choices` empty for every streaming Responses request.
     #[test]
     fn responses_api_output_text_deltas_are_accumulated() {
-        let (mut content, ..) = accumulate(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
-        );
-        let (c2, reasoning, _, _, _) = accumulate(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}",
-        );
+        let (mut content, ..) =
+            accumulate("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}");
+        let (c2, reasoning, _, _, _) =
+            accumulate("data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}");
         content.push_str(&c2);
         assert_eq!(content, "Hello world");
         assert!(reasoning.is_empty());
@@ -765,7 +786,10 @@ mod tests {
         );
         assert_eq!(tool_calls.len(), 1);
         let tc = tool_calls.values().next().unwrap();
-        assert_eq!(tc.pointer("/function/name").and_then(|n| n.as_str()), Some("get_weather"));
+        assert_eq!(
+            tc.pointer("/function/name").and_then(|n| n.as_str()),
+            Some("get_weather")
+        );
         assert!(tc
             .pointer("/function/arguments")
             .and_then(|a| a.as_str())

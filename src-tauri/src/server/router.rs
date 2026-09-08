@@ -404,9 +404,8 @@ mod tests {
             .find_map(|l| l.strip_prefix("password: "))
             .unwrap()
             .to_string();
-        let login_body = |pw: &str| {
-            serde_json::json!({ "username": "admin", "password": pw }).to_string()
-        };
+        let login_body =
+            |pw: &str| serde_json::json!({ "username": "admin", "password": pw }).to_string();
 
         // 成功登录：HttpOnly Cookie + 初始密码文件删除 + token 可用
         let res = app
@@ -425,8 +424,13 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap()
             .to_string();
-        assert!(cookie.contains("HttpOnly"), "cookie 必须带 HttpOnly: {cookie}");
-        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        assert!(
+            cookie.contains("HttpOnly"),
+            "cookie 必须带 HttpOnly: {cookie}"
+        );
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["token"]
             .as_str()
             .unwrap()
@@ -450,7 +454,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let token2 = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["token"]
             .as_str()
             .unwrap()
@@ -503,7 +509,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "第 {i} 次失败应为 400");
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "第 {i} 次失败应为 400"
+            );
         }
         let res = app
             .clone()
@@ -514,7 +524,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS, "第 7 次应被限速");
+        assert_eq!(
+            res.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "第 7 次应被限速"
+        );
         assert!(res.headers().get("Retry-After").is_some());
     }
 }
