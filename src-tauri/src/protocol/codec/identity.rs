@@ -190,9 +190,7 @@ impl IdentityStreamDecoder {
                 // DeepSeek-compatible upstreams report cache hits with their
                 // own field names instead of OpenAI *_details or Anthropic
                 // cache_read_input_tokens.
-                usage
-                    .get("prompt_cache_hit_tokens")
-                    .and_then(Value::as_u64)
+                usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64)
             })
         {
             merged.cache_read_input_tokens = cache_read;
@@ -303,11 +301,7 @@ pub(crate) fn parse_usage(protocol: Protocol, body: &Value) -> Option<Usage> {
                     .and_then(|d| d.get("cached_tokens"))
                     .and_then(Value::as_u64)
             })
-            .or_else(|| {
-                usage
-                    .get("prompt_cache_hit_tokens")
-                    .and_then(Value::as_u64)
-            })
+            .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
             .unwrap_or_default(),
         usage_unknown: input.is_none() || output.is_none(),
     })

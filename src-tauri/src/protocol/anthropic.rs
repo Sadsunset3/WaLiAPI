@@ -37,7 +37,11 @@ fn event(name: &str, value: Value) -> String {
 
 impl AnthropicStreamState {
     pub fn usage(&self) -> (i64, i64, i64) {
-        (self.input_tokens as i64, self.output_tokens as i64, self.cached_tokens as i64)
+        (
+            self.input_tokens as i64,
+            self.output_tokens as i64,
+            self.cached_tokens as i64,
+        )
     }
     /// Feed arbitrary network bytes.  A TCP chunk may split a UTF-8 codepoint,
     /// an SSE field, or the CRLF event delimiter, so bytes are retained until a

@@ -13,8 +13,8 @@ mod message;
 mod stream;
 
 pub use decode::{decode_messages_response_to_chat, NonStreamResponseDecoder};
-pub use encode::encode_messages_to_chat;
 pub(crate) use encode::anthropic_thinking_to_reasoning_effort;
+pub use encode::encode_messages_to_chat;
 pub use stream::MessagesStreamDecoder;
 // Facade contract: these pre-split public items stay reachable through
 // `messages::` (zero public API change).  `usage_from_messages` has no in-crate

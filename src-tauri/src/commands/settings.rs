@@ -8,6 +8,10 @@ use crate::AppState;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
+    #[serde(default = "default_log_detail_level")]
+    pub log_detail_level: String,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u64,
     #[serde(default = "default_port")]
     pub server_port: u16,
     #[serde(default = "default_host")]
@@ -96,10 +100,18 @@ fn default_ocr_concurrency() -> i32 {
 fn default_ocr_dpi() -> i32 {
     200
 }
+fn default_log_detail_level() -> String {
+    "basic".to_string()
+}
+fn default_log_retention_days() -> u64 {
+    7
+}
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            log_detail_level: default_log_detail_level(),
+            log_retention_days: default_log_retention_days(),
             server_port: default_port(),
             server_host: default_host(),
             ui_theme: default_theme(),
@@ -155,7 +167,9 @@ pub struct FeatureFlagsDto {
 }
 
 #[tauri::command]
-pub fn get_feature_flags(state: tauri::State<'_, Arc<AppState>>) -> Result<FeatureFlagsDto, String> {
+pub fn get_feature_flags(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<FeatureFlagsDto, String> {
     let f = crate::core::feature_flags::read_feature_flags(&state.settings);
     Ok(FeatureFlagsDto {
         new_routeplan: f.new_routeplan,
@@ -170,7 +184,17 @@ pub fn get_feature_flags(state: tauri::State<'_, Arc<AppState>>) -> Result<Featu
 #[tauri::command]
 pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Settings, String> {
     let store = &state.settings;
+    let detail_level = get_str(store, "logs.detail_level", "basic");
+    let log_detail_level = if detail_level.eq_ignore_ascii_case("detailed") {
+        "detailed".to_string()
+    } else {
+        "basic".to_string()
+    };
+    let log_retention_days =
+        crate::audit_log::normalize_retention_days(get_u64(store, "logs.retention_days", 7));
     let settings = Settings {
+        log_detail_level,
+        log_retention_days,
         server_port: get_u64(store, "server.port", 8777) as u16,
         server_host: get_str(store, "server.host", "127.0.0.1"),
         ui_theme: get_str(store, "ui.theme", "dark"),
@@ -203,31 +227,119 @@ pub async fn save_settings(
     settings: Settings,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if !settings.log_detail_level.eq_ignore_ascii_case("basic")
+        && !settings.log_detail_level.eq_ignore_ascii_case("detailed")
+    {
+        return Err("无效的日志级别，仅支持 basic 或 detailed".to_string());
+    }
+    if !matches!(settings.log_retention_days, 0 | 1 | 7 | 30 | 90) {
+        return Err("无效的日志保留期，仅支持 1、7、30、90 天或永久".to_string());
+    }
     state.settings.set_many(&[
-        ("server.port".to_string(), serde_json::json!(settings.server_port)),
-        ("server.host".to_string(), serde_json::json!(settings.server_host)),
+        (
+            "logs.detail_level".to_string(),
+            serde_json::json!(settings.log_detail_level),
+        ),
+        (
+            "logs.retention_days".to_string(),
+            serde_json::json!(settings.log_retention_days),
+        ),
+        (
+            "server.port".to_string(),
+            serde_json::json!(settings.server_port),
+        ),
+        (
+            "server.host".to_string(),
+            serde_json::json!(settings.server_host),
+        ),
         ("ui.theme".to_string(), serde_json::json!(settings.ui_theme)),
-        ("ui.language".to_string(), serde_json::json!(settings.ui_language)),
-        ("general.minimize_to_tray".to_string(), serde_json::json!(settings.minimize_to_tray)),
-        ("general.close_to_tray".to_string(), serde_json::json!(settings.close_to_tray)),
-        ("general.auto_start".to_string(), serde_json::json!(settings.auto_start)),
-        ("retry.enabled".to_string(), serde_json::json!(settings.retry_enabled)),
-        ("retry.times".to_string(), serde_json::json!(settings.retry_times)),
-        ("security.enabled".to_string(), serde_json::json!(settings.security_enabled)),
-        ("security.mode".to_string(), serde_json::json!(settings.security_mode)),
-        ("security.scan_unicode".to_string(), serde_json::json!(settings.security_scan_unicode)),
-        ("security.scan_tools".to_string(), serde_json::json!(settings.security_scan_tools)),
-        ("security.scan_network".to_string(), serde_json::json!(settings.security_scan_network)),
-        ("security.scan_response".to_string(), serde_json::json!(settings.security_scan_response)),
-        ("security.redact_secrets".to_string(), serde_json::json!(settings.security_redact_secrets)),
-        ("security.block_on_critical".to_string(), serde_json::json!(settings.security_block_on_critical)),
-        ("routing.prefer_auth_accounts".to_string(), serde_json::json!(settings.routing_prefer_auth_accounts)),
-        ("routing.prefer_same_protocol".to_string(), serde_json::json!(settings.routing_prefer_same_protocol)),
-        ("ocr.enabled".to_string(), serde_json::json!(settings.ocr_enabled)),
-        ("ocr.max_pages".to_string(), serde_json::json!(settings.ocr_max_pages)),
-        ("ocr.concurrency".to_string(), serde_json::json!(settings.ocr_concurrency)),
+        (
+            "ui.language".to_string(),
+            serde_json::json!(settings.ui_language),
+        ),
+        (
+            "general.minimize_to_tray".to_string(),
+            serde_json::json!(settings.minimize_to_tray),
+        ),
+        (
+            "general.close_to_tray".to_string(),
+            serde_json::json!(settings.close_to_tray),
+        ),
+        (
+            "general.auto_start".to_string(),
+            serde_json::json!(settings.auto_start),
+        ),
+        (
+            "retry.enabled".to_string(),
+            serde_json::json!(settings.retry_enabled),
+        ),
+        (
+            "retry.times".to_string(),
+            serde_json::json!(settings.retry_times),
+        ),
+        (
+            "security.enabled".to_string(),
+            serde_json::json!(settings.security_enabled),
+        ),
+        (
+            "security.mode".to_string(),
+            serde_json::json!(settings.security_mode),
+        ),
+        (
+            "security.scan_unicode".to_string(),
+            serde_json::json!(settings.security_scan_unicode),
+        ),
+        (
+            "security.scan_tools".to_string(),
+            serde_json::json!(settings.security_scan_tools),
+        ),
+        (
+            "security.scan_network".to_string(),
+            serde_json::json!(settings.security_scan_network),
+        ),
+        (
+            "security.scan_response".to_string(),
+            serde_json::json!(settings.security_scan_response),
+        ),
+        (
+            "security.redact_secrets".to_string(),
+            serde_json::json!(settings.security_redact_secrets),
+        ),
+        (
+            "security.block_on_critical".to_string(),
+            serde_json::json!(settings.security_block_on_critical),
+        ),
+        (
+            "routing.prefer_auth_accounts".to_string(),
+            serde_json::json!(settings.routing_prefer_auth_accounts),
+        ),
+        (
+            "routing.prefer_same_protocol".to_string(),
+            serde_json::json!(settings.routing_prefer_same_protocol),
+        ),
+        (
+            "ocr.enabled".to_string(),
+            serde_json::json!(settings.ocr_enabled),
+        ),
+        (
+            "ocr.max_pages".to_string(),
+            serde_json::json!(settings.ocr_max_pages),
+        ),
+        (
+            "ocr.concurrency".to_string(),
+            serde_json::json!(settings.ocr_concurrency),
+        ),
         ("ocr.dpi".to_string(), serde_json::json!(settings.ocr_dpi)),
     ])?;
+    crate::audit_log::apply_settings(&state.settings);
+    // 缩短保留期后立即清理，避免等待后台维护周期。
+    let retention_days = crate::audit_log::policy_from_settings(&state.settings).retention_days;
+    let pool = state.db.pool.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = crate::audit_log::cleanup_expired_logs(&pool, retention_days).await {
+            tracing::warn!(%error, "审计日志设置变更后的清理失败");
+        }
+    });
     Ok(())
 }
 

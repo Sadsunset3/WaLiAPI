@@ -194,6 +194,11 @@ export interface RequestLog {
   client_cancelled: boolean | null;
   stream_committed: boolean | null;
   upstream_type: "channel" | "auth_account" | string;
+  /** 日志记录级别；摘要列表也会返回该字段。 */
+  detail_level?: "basic" | "detailed" | string;
+  /** 基本日志不提供正文，详细日志可按需加载。 */
+  detail_available?: boolean;
+  started_at?: string | null;
 }
 
 // Auth account contracts intentionally expose only renderer-safe account
@@ -425,6 +430,8 @@ export interface Settings {
   ocr_max_pages: number;
   ocr_concurrency: number;
   ocr_dpi: number;
+  log_detail_level: "basic" | "detailed" | string;
+  log_retention_days: number;
 }
 
 // Security rule types

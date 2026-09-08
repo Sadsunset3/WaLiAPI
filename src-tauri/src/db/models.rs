@@ -391,6 +391,54 @@ pub struct RequestLog {
     pub cached_tokens: i64,
 }
 
+/// Lightweight row used by the audit-log list. Large request/response bodies
+/// are intentionally excluded from this contract and loaded only by id.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RequestLogSummary {
+    pub id: String,
+    pub seq: Option<i64>,
+    pub api_key_name: Option<String>,
+    pub channel_name: Option<String>,
+    pub model: String,
+    pub upstream_model: Option<String>,
+    pub mode: String,
+    pub status_code: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub cached_tokens: i64,
+    pub duration_ms: i64,
+    pub error_message: Option<String>,
+    pub is_stream: i64,
+    pub is_retry: i64,
+    pub created_at: String,
+    pub risk_level: String,
+    pub risk_score: i64,
+    pub risk_summary: Option<String>,
+    pub security_action: String,
+    pub sanitized: i64,
+    pub blocked_reason: Option<String>,
+    pub trace_id: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub downstream_protocol: Option<String>,
+    pub downstream_endpoint: Option<String>,
+    pub route_group: Option<String>,
+    pub upstream_protocol: Option<String>,
+    pub upstream_endpoint: Option<String>,
+    pub provider: Option<String>,
+    pub codec_version: Option<String>,
+    pub failure_class: Option<String>,
+    pub identity_revision: Option<i64>,
+    pub client_cancelled: Option<i64>,
+    pub stream_committed: Option<i64>,
+    pub upstream_type: String,
+    pub detail_level: String,
+    pub started_at: Option<String>,
+    pub request_body_bytes: i64,
+    pub response_choices_bytes: i64,
+    pub has_request_body: bool,
+}
+
 impl Default for RequestLog {
     fn default() -> Self {
         Self {

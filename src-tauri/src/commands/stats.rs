@@ -89,16 +89,19 @@ pub async fn get_model_stats_impl(
 ) -> Result<Vec<ModelStatsDto>, String> {
     let repo = Repository::new(state.db.pool.clone());
     let stats = repo.get_model_stats().await.map_err(|e| e.to_string())?;
-    Ok(stats.into_iter().map(|s| ModelStatsDto {
-        model: s.model,
-        request_count: s.request_count,
-        input_tokens: s.input_tokens,
-        output_tokens: s.output_tokens,
-        cached_tokens: s.cached_tokens,
-        total_tokens: s.total_tokens,
-        success_rate: s.success_rate,
-        avg_latency_ms: s.avg_latency_ms,
-    }).collect())
+    Ok(stats
+        .into_iter()
+        .map(|s| ModelStatsDto {
+            model: s.model,
+            request_count: s.request_count,
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cached_tokens: s.cached_tokens,
+            total_tokens: s.total_tokens,
+            success_rate: s.success_rate,
+            avg_latency_ms: s.avg_latency_ms,
+        })
+        .collect())
 }
 
 // ── Token 趋势 ──
@@ -128,14 +131,20 @@ pub async fn get_token_trend_impl(
 ) -> Result<Vec<TokenTrendPointDto>, String> {
     let hours = hours.unwrap_or(24);
     let repo = Repository::new(state.db.pool.clone());
-    let points = repo.get_token_trend(hours).await.map_err(|e| e.to_string())?;
-    Ok(points.into_iter().map(|p| TokenTrendPointDto {
-        hour: p.hour,
-        model: p.model,
-        input_tokens: p.input_tokens,
-        output_tokens: p.output_tokens,
-        cached_tokens: p.cached_tokens,
-        total_tokens: p.total_tokens,
-        request_count: p.request_count,
-    }).collect())
+    let points = repo
+        .get_token_trend(hours)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(points
+        .into_iter()
+        .map(|p| TokenTrendPointDto {
+            hour: p.hour,
+            model: p.model,
+            input_tokens: p.input_tokens,
+            output_tokens: p.output_tokens,
+            cached_tokens: p.cached_tokens,
+            total_tokens: p.total_tokens,
+            request_count: p.request_count,
+        })
+        .collect())
 }

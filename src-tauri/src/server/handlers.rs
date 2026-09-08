@@ -170,7 +170,8 @@ async fn maybe_route_plan(
         &mut plan_rng,
     ) {
         Ok(plan) => plan,
-        Err(e) => {            let code = e.http_status();
+        Err(e) => {
+            let code = e.http_status();
             // I-3: a facade rejection (auth / no candidate / no endpoint)
             // must be observable in the RequestLog on BOTH paths, except for
             // Count Tokens which is deliberately excluded from request history.
@@ -205,8 +206,7 @@ async fn maybe_route_plan(
     {
         let (retry_enabled, retry_times) =
             crate::core::proxy::get_retry_settings(&shared.state.settings);
-        let (per_group, total) =
-            route_plan::retry_budget_from_settings(retry_enabled, retry_times);
+        let (per_group, total) = route_plan::retry_budget_from_settings(retry_enabled, retry_times);
         plan.apply_retry_budget(per_group, total);
     }
     if is_stream {
@@ -221,9 +221,7 @@ async fn maybe_route_plan(
             trace_id,
             shared.state.auth_service.clone(),
             // 流式超时（FIX-08）从设置读取（stream.*_timeout_secs，缺省 60/120s）。
-            crate::endpoint_executor::driver::StreamTimeouts::from_settings(
-                &shared.state.settings,
-            ),
+            crate::endpoint_executor::driver::StreamTimeouts::from_settings(&shared.state.settings),
         )
         .await;
         Ok(Some(resp))
@@ -1441,8 +1439,7 @@ impl NativeStreamFinalizer {
     }
 
     fn mark_done(&self) {
-        self.done
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 上游中断：502 行 + 已解析的部分用量。
@@ -1467,13 +1464,9 @@ impl NativeStreamFinalizer {
 
     /// 请求体 prompt 估算（completion 无内容可估时为 0）。
     fn estimated_usage(&self) -> Option<(i64, i64, i64)> {
-        let req_body =
-            serde_json::to_value(&self.request).unwrap_or(serde_json::Value::Null);
-        let (p, c, t) = crate::endpoint_executor::estimate_usage::estimate_usage(
-            &req_body,
-            None,
-            &self.model,
-        );
+        let req_body = serde_json::to_value(&self.request).unwrap_or(serde_json::Value::Null);
+        let (p, c, t) =
+            crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, None, &self.model);
         (t > 0).then_some((p, c, t))
     }
 }
@@ -1579,8 +1572,13 @@ impl NativeSseUsageParser {
     /// FIX-12：改 `&mut self`——解析器在 Mutex 内共享，Drop/中断路径需要
     /// 多次读取部分用量而不消耗解析器。
     fn finish(&mut self) -> Option<(i64, i64, i64)> {
-        (!self.malformed_or_oversized && self.stopped)
-            .then(|| (self.input.unwrap_or(0), self.output.unwrap_or(0), self.cached.unwrap_or(0)))
+        (!self.malformed_or_oversized && self.stopped).then(|| {
+            (
+                self.input.unwrap_or(0),
+                self.output.unwrap_or(0),
+                self.cached.unwrap_or(0),
+            )
+        })
     }
 }
 
@@ -1831,10 +1829,7 @@ fn request_has_image_blocks(body: &serde_json::Value) -> bool {
 /// FIX-18（#15）：原生渠道 400 且请求含图片块时，在错误体 message 追加
 /// 诊断提示。视觉能力路由（`supports_vision` 渠道标记 + failover 跳过）
 /// 为长期方案（docs/reliability-fixes-prd.md 票 03），当前只提示不改路由。
-fn annotate_vision_hint(
-    err: StoredNativeError,
-    request: &serde_json::Value,
-) -> StoredNativeError {
+fn annotate_vision_hint(err: StoredNativeError, request: &serde_json::Value) -> StoredNativeError {
     const HINT: &str =
         "（该渠道疑似不支持图片：请求含图片内容块而上游以 400 拒绝，可切换到支持视觉的渠道）";
     if err.status != StatusCode::BAD_REQUEST || !request_has_image_blocks(request) {
@@ -2422,7 +2417,10 @@ pub async fn handle_messages(
                     .and_then(|value| value.as_str())
                     .unwrap_or("OpenAI Chat Completions upstream rejected the request");
                 last_error = format!("{}: {message}", channel.name);
-                match upstream_failover_decision_with_body(status.as_u16(), Some(upstream.to_string().as_str())) {
+                match upstream_failover_decision_with_body(
+                    status.as_u16(),
+                    Some(upstream.to_string().as_str()),
+                ) {
                     FailoverDecision::Failover => {
                         last_openai_error = Some((status, message.to_string(), response_headers));
                     }
@@ -4254,7 +4252,9 @@ mod anthropic_handler_tests {
             status: StatusCode::TOO_MANY_REQUESTS,
             content_type: None,
             headers: vec![],
-            body: bytes::Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            body: bytes::Bytes::from(
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+            ),
         };
         let untouched = annotate_vision_hint(err429, &request);
         assert!(!String::from_utf8_lossy(&untouched.body).contains("疑似不支持"));
@@ -4625,8 +4625,12 @@ mod list_models_tests {
                 serde_json::json!({"alias-b": "claude-sonnet-4"}),
             ),
         ];
-        let visibility =
-            ApiKeyVisibility::from(&key(&["api-a"], &[], &["gpt-4o", "alias-a"], &["gpt-4o-mini"]));
+        let visibility = ApiKeyVisibility::from(&key(
+            &["api-a"],
+            &[],
+            &["gpt-4o", "alias-a"],
+            &["gpt-4o-mini"],
+        ));
         let models = collect_config_models(&channels, Some(&visibility));
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-4o", "alias-a"]);

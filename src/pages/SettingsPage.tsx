@@ -568,6 +568,38 @@ export function SettingsPage() {
           </div>
           </div>
           <div>
+            <h3 className="mb-3 text-sm font-medium text-muted-foreground">审计日志</h3>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div>
+                <label className="mb-2 block text-sm font-medium">日志级别</label>
+                <select
+                  value={settings.log_detail_level}
+                  onChange={e => setSettings({ ...settings, log_detail_level: e.target.value })}
+                  className={selectCls}
+                >
+                  <option value="basic">基本</option>
+                  <option value="detailed">详情</option>
+                </select>
+                <p className="mt-1 text-xs text-muted-foreground">基本模式只保存请求状态与用量摘要；详情模式会保存完整请求/响应正文，可能显著增加数据库大小。</p>
+              </div>
+              <div>
+                <label className="mb-2 block text-sm font-medium">日志保留期</label>
+                <select
+                  value={settings.log_retention_days}
+                  onChange={e => setSettings({ ...settings, log_retention_days: Number(e.target.value) })}
+                  className={selectCls}
+                >
+                  <option value={1}>1 天</option>
+                  <option value={7}>7 天</option>
+                  <option value={30}>30 天</option>
+                  <option value={90}>90 天</option>
+                  <option value={0}>永久保留</option>
+                </select>
+                <p className="mt-1 text-xs text-muted-foreground">过期审计日志会由服务自动清理；删除后数据库文件需单独压缩才会缩小。</p>
+              </div>
+            </div>
+          </div>
+          <div>
             <h3 className="mb-3 text-sm font-medium text-muted-foreground">路由设置</h3>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
               <label className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">

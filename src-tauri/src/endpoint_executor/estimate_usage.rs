@@ -150,8 +150,7 @@ static CL100K_SINGLETON: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> =
 
 /// 仅供测试观察：BPE 实际构建次数。
 #[cfg(test)]
-static CL100K_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static CL100K_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn cl100k_singleton() -> Option<&'static tiktoken_rs::CoreBPE> {
     CL100K_SINGLETON
@@ -161,7 +160,9 @@ fn cl100k_singleton() -> Option<&'static tiktoken_rs::CoreBPE> {
             match cl100k_base() {
                 Ok(bpe) => Some(bpe),
                 Err(e) => {
-                    tracing::warn!("cl100k_base tokenizer init failed, falling back to char estimate: {e}");
+                    tracing::warn!(
+                        "cl100k_base tokenizer init failed, falling back to char estimate: {e}"
+                    );
                     None
                 }
             }

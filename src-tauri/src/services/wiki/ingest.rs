@@ -899,10 +899,7 @@ async fn replace_graph_edges(
     project_id: &str,
     links: Vec<(String, String)>,
 ) -> Result<(), String> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+    let mut tx = pool.begin().await.map_err(|e| format!("DB error: {}", e))?;
     sqlx::query("DELETE FROM wiki_graph_edges WHERE project_id = ?")
         .bind(project_id)
         .execute(&mut *tx)
@@ -913,7 +910,10 @@ async fn replace_graph_edges(
         let mut sql = String::from(
             "INSERT OR IGNORE INTO wiki_graph_edges (id, project_id, source_page, target_page, edge_type, weight, created_at) VALUES ",
         );
-        let groups: Vec<&str> = chunk.iter().map(|_| "(?, ?, ?, ?, 'wikilink', 1.0, ?)").collect();
+        let groups: Vec<&str> = chunk
+            .iter()
+            .map(|_| "(?, ?, ?, ?, 'wikilink', 1.0, ?)")
+            .collect();
         sql.push_str(&groups.join(", "));
         let mut query = sqlx::query(&sql);
         for (source, target) in chunk {
@@ -1121,8 +1121,14 @@ mod tests {
         .await
         .unwrap();
         // Alpha→Beta（标题解析）；Gamma→自身（路径直通）；Beta→ghost 不存在 → 无边
-        assert!(edges.contains(&("a.md".to_string(), "b.md".to_string())), "edges: {edges:?}");
-        assert!(edges.contains(&("docs/c.md".to_string(), "docs/c.md".to_string())), "edges: {edges:?}");
+        assert!(
+            edges.contains(&("a.md".to_string(), "b.md".to_string())),
+            "edges: {edges:?}"
+        );
+        assert!(
+            edges.contains(&("docs/c.md".to_string(), "docs/c.md".to_string())),
+            "edges: {edges:?}"
+        );
         assert_eq!(edges.len(), 2, "幽灵链接不得建边: {edges:?}");
     }
 

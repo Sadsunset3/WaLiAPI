@@ -105,10 +105,7 @@ pub enum UpstreamItem<E> {
 ///
 /// If the stream does not produce an item within `idle_timeout`, returns
 /// [`UpstreamItem::IdleTimeout`] instead of waiting indefinitely.
-pub async fn next_upstream_item<S, E>(
-    upstream: &mut S,
-    idle_timeout: Duration,
-) -> UpstreamItem<E>
+pub async fn next_upstream_item<S, E>(upstream: &mut S, idle_timeout: Duration) -> UpstreamItem<E>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
 {
@@ -1077,11 +1074,7 @@ pub fn extract_usage(protocol: &str, endpoint: &str, body: &Value) -> Option<Tok
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64)
             .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
-            .or_else(|| {
-                usage
-                    .get("prompt_cache_hit_tokens")
-                    .and_then(Value::as_u64)
-            })
+            .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
             .unwrap_or(0);
         return Some(TokenUsage {
             prompt_tokens: input,
@@ -1105,9 +1098,7 @@ pub fn extract_usage(protocol: &str, endpoint: &str, body: &Value) -> Option<Tok
         .and_then(Value::as_u64)
         .or_else(|| {
             // DeepSeek-compatible upstreams use their own cache-hit field.
-            usage
-                .get("prompt_cache_hit_tokens")
-                .and_then(Value::as_u64)
+            usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64)
         })
         .unwrap_or(0);
     Some(TokenUsage {
@@ -1201,7 +1192,11 @@ mod tests {
         headers.insert("retry-after", "3600".parse().unwrap());
         let dur = retry_after_from_headers(&headers).unwrap();
         // With ±20% jitter on 5s, range is [4, 6].
-        assert!(dur.as_secs() >= 4 && dur.as_secs() <= 6, "capped+jit={:?}", dur);
+        assert!(
+            dur.as_secs() >= 4 && dur.as_secs() <= 6,
+            "capped+jit={:?}",
+            dur
+        );
     }
 
     #[test]

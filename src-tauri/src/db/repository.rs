@@ -1190,12 +1190,25 @@ impl Repository {
     // ==================== Request Log ====================
 
     pub async fn create_log(&self, log: &RequestLog) -> Result<(), sqlx::Error> {
+        self.create_log_with_policy(log, crate::audit_log::current_policy())
+            .await
+    }
+
+    /// Persist a request log using an explicit policy. The normal runtime path
+    /// uses `create_log`; this variant keeps policy application close to the
+    /// INSERT and makes the behavior independently testable.
+    pub async fn create_log_with_policy(
+        &self,
+        log: &RequestLog,
+        policy: crate::audit_log::LogPolicy,
+    ) -> Result<(), sqlx::Error> {
+        let log = crate::audit_log::effective_log_with_policy(log, policy);
         // Insert with seq auto-incremented via subquery (atomic, avoids race condition).
         // The 11 T09 observability columns (migration 016) are bound as Option<> so
         // legacy callers using `..Default::default()` persist NULLs for them.
         sqlx::query(
-            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id, reasoning_effort, downstream_protocol, downstream_endpoint, route_group, upstream_protocol, upstream_endpoint, provider, codec_version, failure_class, identity_revision, client_cancelled, stream_committed, upstream_type)
-             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id, reasoning_effort, downstream_protocol, downstream_endpoint, route_group, upstream_protocol, upstream_endpoint, provider, codec_version, failure_class, identity_revision, client_cancelled, stream_committed, upstream_type, detail_level)
+             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&log.id)
         .bind(&log.api_key_id)
@@ -1237,6 +1250,10 @@ impl Repository {
         .bind(log.client_cancelled)
         .bind(log.stream_committed)
         .bind(&log.upstream_type)
+        .bind(match policy.detail_level {
+            crate::audit_log::LogDetailLevel::Detailed => "detailed",
+            crate::audit_log::LogDetailLevel::Basic => "basic",
+        })
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1292,6 +1309,10 @@ impl Repository {
     }
 
     pub async fn delete_logs_before(&self, before_date: &str) -> Result<u64, sqlx::Error> {
+        sqlx::query("DELETE FROM request_security_findings WHERE log_id IN (SELECT id FROM request_logs WHERE created_at < ?)")
+            .bind(before_date)
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE created_at < ?")
             .bind(before_date)
             .execute(&self.pool)
@@ -1300,6 +1321,9 @@ impl Repository {
     }
 
     pub async fn delete_all_logs(&self) -> Result<u64, sqlx::Error> {
+        sqlx::query("DELETE FROM request_security_findings")
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&self.pool)
             .await?;
@@ -1307,6 +1331,10 @@ impl Repository {
     }
 
     pub async fn delete_log(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM request_security_findings WHERE log_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM request_logs WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -1322,6 +1350,92 @@ impl Repository {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
+    }
+
+    pub async fn get_log_summaries(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::db::models::RequestLogSummary>, sqlx::Error> {
+        self.search_log_summaries(
+            None, None, None, None, None, None, None, None, limit, offset,
+        )
+        .await
+    }
+
+    pub async fn search_log_summaries(
+        &self,
+        keyword: Option<&str>,
+        api_key_name: Option<&str>,
+        channel_name: Option<&str>,
+        model: Option<&str>,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        trace_id: Option<&str>,
+        upstream_type: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::db::models::RequestLogSummary>, sqlx::Error> {
+        let mut q = sqlx::QueryBuilder::new(
+            "SELECT id, seq, api_key_name, channel_name, model, upstream_model, mode, status_code, \
+             prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, error_message, \
+             is_stream, is_retry, created_at, risk_level, risk_score, risk_summary, security_action, \
+             sanitized, blocked_reason, trace_id, reasoning_effort, downstream_protocol, downstream_endpoint, \
+             route_group, upstream_protocol, upstream_endpoint, provider, codec_version, failure_class, \
+             identity_revision, client_cancelled, stream_committed, upstream_type, \
+             COALESCE(detail_level, 'detailed') AS detail_level, started_at, \
+             COALESCE(length(CAST(request_body AS BLOB)), 0) AS request_body_bytes, \
+             COALESCE(length(CAST(response_choices AS BLOB)), 0) AS response_choices_bytes, \
+             (request_body IS NOT NULL) AS has_request_body \
+             FROM request_logs WHERE 1=1",
+        );
+        if let Some(kw) = keyword {
+            let pattern = format!("%{}%", kw);
+            q.push(" AND (api_key_name LIKE ")
+                .push_bind(pattern.clone());
+            q.push(" OR channel_name LIKE ").push_bind(pattern.clone());
+            q.push(" OR model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ")
+                .push_bind(pattern.clone());
+            q.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
+            q.push(" OR id LIKE ").push_bind(pattern);
+            q.push(")");
+        }
+        for (column, value) in [
+            ("api_key_name", api_key_name),
+            ("channel_name", channel_name),
+        ] {
+            if let Some(value) = value {
+                q.push(" AND ")
+                    .push(column)
+                    .push(" LIKE ")
+                    .push_bind(format!("%{}%", value));
+            }
+        }
+        if let Some(value) = model {
+            let pattern = format!("%{}%", value);
+            q.push(" AND (model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ").push_bind(pattern);
+            q.push(")");
+        }
+        if let Some(value) = date_from {
+            q.push(" AND created_at >= ").push_bind(value);
+        }
+        if let Some(value) = date_to {
+            q.push(" AND created_at <= ").push_bind(value);
+        }
+        if let Some(value) = trace_id {
+            q.push(" AND trace_id LIKE ")
+                .push_bind(format!("%{}%", value));
+        }
+        if let Some(value) = upstream_type {
+            q.push(" AND upstream_type = ").push_bind(value);
+        }
+        q.push(" ORDER BY created_at DESC LIMIT ").push_bind(limit);
+        q.push(" OFFSET ").push_bind(offset);
+        q.build_query_as::<crate::db::models::RequestLogSummary>()
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn search_logs(

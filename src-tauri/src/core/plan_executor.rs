@@ -201,7 +201,9 @@ where
                 let meta = last_attempt_meta;
                 let last_failure = flow.last_failure().cloned();
                 let body = match &last_failure {
-                    Some(f) => serde_json::json!({ "error": { "message": message, "failure_class": f.failure_class.as_str() } }),
+                    Some(f) => {
+                        serde_json::json!({ "error": { "message": message, "failure_class": f.failure_class.as_str() } })
+                    }
                     None => serde_json::json!({ "error": { "message": message } }),
                 };
                 return PlanExecution {

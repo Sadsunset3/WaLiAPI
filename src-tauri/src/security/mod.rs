@@ -349,7 +349,11 @@ mod merge_tests {
         scan_response_into(&mut request, &body, &settings_with_response_scan(), &[]);
         assert!(!request.findings.is_empty(), "secret must produce findings");
         assert_ne!(request.risk_level, RiskLevel::Clean);
-        assert!(request.summary.contains("响应侧"), "summary: {}", request.summary);
+        assert!(
+            request.summary.contains("响应侧"),
+            "summary: {}",
+            request.summary
+        );
         assert!(request.findings.iter().all(|f| f.phase == "response"));
     }
 

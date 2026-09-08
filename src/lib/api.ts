@@ -96,6 +96,7 @@ export interface GetLogsInput {
 
 // Log commands
 export const logApi = {
+  /** 列表接口只返回摘要；正文由 get 按日志展开时懒加载。 */
   getAll: (input?: GetLogsInput) => invoke<RequestLog[]>("get_logs", { input: input || {} }),
   get: (id: string) => invoke<RequestLog>("get_log", { id }),
   getSecurityFindings: (logId: string) => invoke<SecurityFinding[]>("get_log_security_findings", { logId }),

@@ -1732,14 +1732,8 @@ async fn handle_tool_call(
 
             // Call the wiki update_page handler logic
             let wiki_repo = WikiRepository::new(pool.clone());
-            let result = wiki_handlers::update_page_inner(
-                pool,
-                &wiki_repo,
-                project_id,
-                path,
-                content,
-            )
-            .await;
+            let result =
+                wiki_handlers::update_page_inner(pool, &wiki_repo, project_id, path, content).await;
 
             match result {
                 Ok(()) => Ok(serde_json::json!({
