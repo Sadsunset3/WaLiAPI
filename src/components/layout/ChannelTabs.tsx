@@ -8,14 +8,14 @@ import { authApi, channelApi } from "../../lib/api";
  * 全宽底边框 + 图标 + 完整标签 + 数量徽标，路由 /channels 与 /channels/auth。
  * 数量自行轻量拉取，保证两个 tab 徽标在任何页面都显示。
  */
-export function ChannelTabs() {
+export function ChannelTabs({ refreshKey = 0 }: { refreshKey?: number }) {
   const [channelCount, setChannelCount] = useState<number | null>(null);
   const [authCount, setAuthCount] = useState<number | null>(null);
 
   useEffect(() => {
     channelApi.getAll().then(cs => setChannelCount(cs.length)).catch(() => {});
     authApi.accountsList().then(as => setAuthCount(as.length)).catch(() => {});
-  }, []);
+  }, [refreshKey]);
 
   const base =
     "inline-flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-1.5 text-sm font-medium transition-colors";
