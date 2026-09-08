@@ -752,13 +752,25 @@ fn sub2api_codex_accounts(
         };
         // sub2api stores the ChatGPT account id as `chatgpt_account_id`
         // (openai_oauth_service.go); normalize it to the `account_id` key the
-        // shared token extractor expects.  An explicit `account_id` wins.
+        // shared token extractor expects.  Preference order (first non-empty
+        // wins): explicit `account_id`, `chatgpt_account_id`, then
+        // `chatgpt_user_id`.  Registrar-created exports carry a full token set
+        // but no account id — only a stable `user-…` id — and must not be
+        // silently dropped (surfacing as a hard import failure).
         let mut normalized = credentials.clone();
-        if !normalized.contains_key("account_id") {
-            if let Some(id) = normalized.get("chatgpt_account_id") {
-                normalized.insert("account_id".to_owned(), id.clone());
-            }
-        }
+        let account_id = ["account_id", "chatgpt_account_id", "chatgpt_user_id"]
+            .iter()
+            .find_map(|key| {
+                normalized
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+            });
+        let Some(account_id) = account_id else {
+            continue;
+        };
+        normalized.insert("account_id".to_owned(), Value::String(account_id));
         let Ok(payload) = codex_payload_from_tokens(&Value::Object(normalized)) else {
             continue;
         };
@@ -1575,6 +1587,44 @@ mod tests {
             accounts[0].label.as_deref(),
             Some("jennifersimon497104t@outlook.com_40刀")
         );
+    }
+
+    #[test]
+    fn sub2api_registrar_export_falls_back_to_chatgpt_user_id() {
+        // Registrar-created exports carry a full token set but an EMPTY
+        // `chatgpt_account_id` and no `account_id` — only `chatgpt_user_id`
+        // is populated.  Regression: every account used to be skipped, which
+        // surfaced as a hard "导入失败" for an otherwise valid file.
+        let fixture = json!({
+            "type": "sub2api-data", "version": 1,
+            "accounts": [
+                {
+                    "name": "mccarnskauer55@outlook.com----U2G6----Gf0@AU2g!",
+                    "platform": "openai", "type": "oauth",
+                    "credentials": {
+                        "access_token": ACCESS, "refresh_token": REFRESH,
+                        "id_token": ID,
+                        "chatgpt_account_id": "",
+                        "chatgpt_user_id": "user-AAFxzpZD5jVl2krLAqE9fIqC"
+                    }
+                },
+                {
+                    "name": "no-account-id-at-all",
+                    "platform": "openai", "type": "oauth",
+                    "credentials": {
+                        "access_token": ACCESS, "refresh_token": REFRESH,
+                        "id_token": ID
+                    }
+                }
+            ]
+        });
+        let accounts = sub2api_codex_accounts(&fixture).unwrap();
+        assert_eq!(accounts.len(), 1, "id-less entry must still be skipped");
+        assert_eq!(
+            accounts[0].payload.as_value()["account_id"],
+            "user-AAFxzpZD5jVl2krLAqE9fIqC"
+        );
+        assert_eq!(accounts[0].payload.as_value()["refresh_token"], REFRESH);
     }
 
     #[test]
