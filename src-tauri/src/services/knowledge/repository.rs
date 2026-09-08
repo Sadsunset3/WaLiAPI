@@ -389,6 +389,22 @@ impl KbRepository {
             .collect())
     }
 
+    /// 该文档现存 chunk 的 (chunk_id, embedding)（文档 ready 且向量非空），
+    /// 增量索引差集的库侧输入。
+    pub async fn get_chunk_vectors_by_doc(
+        &self,
+        doc_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT c.id, c.embedding FROM kb_chunks c \
+             JOIN kb_documents d ON c.doc_id = d.id \
+             WHERE c.doc_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'",
+        )
+        .bind(doc_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn delete_chunks_by_doc(&self, doc_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM kb_chunks WHERE doc_id = ?")
             .bind(doc_id)

@@ -70,6 +70,28 @@ pub async fn delete_kb_document(
     repo.update_kb_counts(&kb_id)
         .await
         .map_err(|e| e.to_string())?;
+    // 增量摘除该文档的索引向量（best-effort：失败仅日志，不阻断删除）
+    {
+        let pool = state.db.pool.clone();
+        let events = state.events.clone();
+        let kb_id = kb_id.clone();
+        let doc_id = doc_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                if let Err(e) =
+                    crate::services::knowledge::retriever::index_delta(&pool, &kb_id, &doc_id, &events)
+                        .await
+                {
+                    tracing::warn!(
+                        "Failed to update HNSW index after doc delete ({}): {}",
+                        doc_id,
+                        e
+                    );
+                }
+            });
+        });
+    }
     Ok(())
 }
 

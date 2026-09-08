@@ -490,7 +490,9 @@ async fn process_document_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 6. Rebuild HNSW index (best-effort, non-blocking on failure)
+    // 6. Update vector index incrementally (best-effort, non-blocking on failure)
+    //    单文档增量（C-06/R1）：不再全库重建；索引缺失/旧格式时 delta 内部
+    //    自动回退全量 build_index。
     emit_progress(
         events,
         doc_id,
@@ -502,14 +504,19 @@ async fn process_document_inner(
     );
     let pool_clone = pool.clone();
     let kb_id_clone = kb_id.to_string();
+    let doc_id_clone = doc_id.to_string();
     let events_clone = events.clone();
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &events_clone).await {
+            if let Err(e) =
+                retriever::index_delta(&pool_clone, &kb_id_clone, &doc_id_clone, &events_clone)
+                    .await
+            {
                 tracing::warn!(
-                    "Failed to rebuild HNSW index for KB {} after doc: {}",
+                    "Failed to update HNSW index for KB {} after doc {}: {}",
                     kb_id_clone,
+                    doc_id_clone,
                     e
                 );
                 events_clone.emit(
@@ -517,7 +524,7 @@ async fn process_document_inner(
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
                         "status": "error",
-                        "message": format!("索引构建失败: {}", e)
+                        "message": format!("索引更新失败: {}", e)
                     }),
                 );
             } else {
@@ -526,7 +533,7 @@ async fn process_document_inner(
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
                         "status": "ready",
-                        "message": "索引构建完成"
+                        "message": "索引更新完成"
                     }),
                 );
             }
