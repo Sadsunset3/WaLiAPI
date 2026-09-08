@@ -276,12 +276,12 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, events: &EventSink) -> 
         return Err("No chunks to index".to_string());
     }
 
-    // Build (chunk_id, vector) pairs
-    let mut items: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
+    // Build (chunk_id, doc_id, vector) triples
+    let mut items: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(chunks.len());
     let mut dim = 0;
 
     tracing::info!("Building HNSW index, processing {} chunks...", chunks.len());
-    for (id, _, _, emb, _, _) in chunks.iter() {
+    for (id, _, _, emb, _, doc_id) in chunks.iter() {
         let vector = decode_embedding(emb);
         if !vector.is_empty() {
             if dim == 0 {
@@ -289,7 +289,7 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, events: &EventSink) -> 
                 tracing::debug!("Detected embedding dimension: {}", dim);
             }
             if vector.len() == dim {
-                items.push((id.clone(), vector));
+                items.push((id.clone(), doc_id.clone(), vector));
             }
         }
     }
