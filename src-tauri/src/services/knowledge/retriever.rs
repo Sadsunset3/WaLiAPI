@@ -991,7 +991,14 @@ mod index_delta_tests {
             add_chunk(&pool, &kb_id, "doc-a", &format!("a-{}", i), i as f32 * 0.3).await;
         }
         for i in 0..6 {
-            add_chunk(&pool, &kb_id, "doc-b", &format!("b-{}", i), 5.0 + i as f32 * 0.3).await;
+            add_chunk(
+                &pool,
+                &kb_id,
+                "doc-b",
+                &format!("b-{}", i),
+                5.0 + i as f32 * 0.3,
+            )
+            .await;
         }
 
         build_index(&pool, &kb_id, &events).await.unwrap();
@@ -1002,20 +1009,23 @@ mod index_delta_tests {
             .await
             .unwrap();
         for i in 0..3 {
-            add_chunk(&pool, &kb_id, "doc-a", &format!("a-n{}", i), 2.0 + i as f32 * 0.2).await;
+            add_chunk(
+                &pool,
+                &kb_id,
+                "doc-a",
+                &format!("a-n{}", i),
+                2.0 + i as f32 * 0.2,
+            )
+            .await;
         }
-        index_delta(&pool, &kb_id, "doc-a", &events)
-            .await
-            .unwrap();
+        index_delta(&pool, &kb_id, "doc-a", &events).await.unwrap();
 
         // doc-b 整删（FK 级联删 chunk）
         sqlx::query("DELETE FROM kb_documents WHERE id = 'doc-b'")
             .execute(&pool)
             .await
             .unwrap();
-        index_delta(&pool, &kb_id, "doc-b", &events)
-            .await
-            .unwrap();
+        index_delta(&pool, &kb_id, "doc-b", &events).await.unwrap();
 
         let index = HnswIndex::load(&index_path(&kb_id)).unwrap();
         assert!(!index.contains_live("a-0"), "removed chunk must be gone");
@@ -1048,9 +1058,7 @@ mod index_delta_tests {
         add_chunk(&pool, &kb_id, "doc-a", "a-1", 1.5).await;
 
         // 场景 1：索引文件不存在 → delta 后建立
-        index_delta(&pool, &kb_id, "doc-a", &events)
-            .await
-            .unwrap();
+        index_delta(&pool, &kb_id, "doc-a", &events).await.unwrap();
         let index = HnswIndex::load(&index_path(&kb_id)).unwrap();
         assert!(index.contains_live("a-0") && index.contains_live("a-1"));
 
@@ -1062,13 +1070,16 @@ mod index_delta_tests {
         let mut legacy = HnswIndex::new(3, 16, 200, 50);
         legacy.build(&legacy_items);
         legacy.save(&index_path(&kb_id)).unwrap();
-        assert!(HnswIndex::load(&index_path(&kb_id)).unwrap().is_legacy_format());
+        assert!(HnswIndex::load(&index_path(&kb_id))
+            .unwrap()
+            .is_legacy_format());
 
-        index_delta(&pool, &kb_id, "doc-a", &events)
-            .await
-            .unwrap();
+        index_delta(&pool, &kb_id, "doc-a", &events).await.unwrap();
         let rebuilt = HnswIndex::load(&index_path(&kb_id)).unwrap();
-        assert!(!rebuilt.is_legacy_format(), "fallback rebuild populates doc ids");
+        assert!(
+            !rebuilt.is_legacy_format(),
+            "fallback rebuild populates doc ids"
+        );
         assert!(rebuilt.contains_live("a-0"));
         assert_eq!(rebuilt.doc_node_ids("doc-a").len(), 2);
 

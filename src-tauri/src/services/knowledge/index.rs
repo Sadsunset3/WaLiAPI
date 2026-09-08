@@ -318,9 +318,7 @@ impl HnswIndex {
     /// 旧格式索引（节点无 doc_id）：增量路径应回退全量重建。
     /// schema 中 chunk 的 doc_id 非空，因此「有节点且全空」即旧文件。
     pub fn is_legacy_format(&self) -> bool {
-        self.initialized
-            && !self.nodes.is_empty()
-            && self.nodes.iter().all(|n| n.doc_id.is_empty())
+        self.initialized && !self.nodes.is_empty() && self.nodes.iter().all(|n| n.doc_id.is_empty())
     }
 
     /// Internal greedy search starting from the entry point.

@@ -79,9 +79,10 @@ pub async fn delete_kb_document(
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
-                if let Err(e) =
-                    crate::services::knowledge::retriever::index_delta(&pool, &kb_id, &doc_id, &events)
-                        .await
+                if let Err(e) = crate::services::knowledge::retriever::index_delta(
+                    &pool, &kb_id, &doc_id, &events,
+                )
+                .await
                 {
                     tracing::warn!(
                         "Failed to update HNSW index after doc delete ({}): {}",

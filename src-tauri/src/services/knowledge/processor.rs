@@ -615,7 +615,8 @@ mod tests {
     #[test]
     fn split_empty_existing_embeds_all() {
         let hashes: Vec<String> = vec!["a".to_string(), "b".to_string()];
-        let (to_embed, reused) = split_chunks_for_embedding(&hashes, &std::collections::HashMap::new());
+        let (to_embed, reused) =
+            split_chunks_for_embedding(&hashes, &std::collections::HashMap::new());
         assert_eq!(to_embed, vec![0, 1]);
         assert!(reused.is_empty());
     }
