@@ -715,7 +715,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-fn decode_embedding(blob: &[u8]) -> Vec<f32> {
+pub fn decode_embedding(blob: &[u8]) -> Vec<f32> {
     bincode::deserialize(blob).unwrap_or_default()
 }
 
