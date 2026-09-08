@@ -115,17 +115,17 @@ export function AuthChannelsPage() {
   // "Provider filter 不隐藏新增账号后的刷新结果").
   const visibleAccounts = accounts.filter((a) => a.provider === selectedProvider);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (showLoading = true) => {
+    if (showLoading) setLoading(true);
     try { setAccounts(await authApi.accountsList()); }
     catch (_) { setNotice({ kind: "error", message: "Auth 账号加载失败，请检查本地服务后重试。" }); }
-    finally { setLoading(false); }
+    finally { if (showLoading) setLoading(false); }
   }, []);
   useEffect(() => { void load(); }, [load]);
 
   const runFor = async (id: string, success: string, work: () => Promise<void>) => {
     setPendingId(id);
-    try { await work(); setNotice({ kind: "success", message: success }); await load(); }
+    try { await work(); setNotice({ kind: "success", message: success }); await load(false); }
     catch (_) { setNotice({ kind: "error", message: "操作失败，请稍后重试。" }); }
     finally { setPendingId(null); }
   };
@@ -135,7 +135,7 @@ export function AuthChannelsPage() {
     try {
       await authApi.refreshQuota(id);
       setNotice({ kind: "success", message: "额度刷新完成。" });
-      await load();
+      await load(false);
     } catch (_) {
       setNotice({ kind: "error", message: "额度刷新失败，已保留上次额度数据。" });
     } finally {
@@ -148,7 +148,7 @@ export function AuthChannelsPage() {
     setReloginAccount(null);
     const displayName = activeProvider.displayName;
     setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: `${displayName} 账号登录完成。` });
-    void load();
+    void load(false);
   };
   const importAuth = async (format: ImportFormat) => {
     // Web 版：浏览器文件选择器读取内容后按内容导入
@@ -159,7 +159,7 @@ export function AuthChannelsPage() {
       try {
         const result = await authApi.loginImportContent("codex", content, format);
         setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: importSuccessMessage(result, "已导入账号。") });
-        await load();
+        await load(false);
         setChannelTabRefreshKey((key) => key + 1);
       } catch (_) {
         setNotice({ kind: "error", message: `导入失败，请确认所选文件是有效的${optionLabel(format)}。` });
@@ -193,7 +193,7 @@ export function AuthChannelsPage() {
     try {
       const result = await authApi.loginImport("codex", path, format);
       setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: importSuccessMessage(result, `已从 ${label} 导入账号。`) });
-      await load();
+      await load(false);
       setChannelTabRefreshKey((key) => key + 1);
     } catch (_) {
       setNotice({ kind: "error", message: `导入失败，请确认所选文件是有效的${optionLabel(format)}。` });
@@ -207,7 +207,7 @@ export function AuthChannelsPage() {
       await authApi.logout(account.id);
       setNotice({ kind: "success", message: "账号已删除。" });
       setConfirmation(null);
-      await load();
+      await load(false);
     } catch (_) {
       setNotice({ kind: "error", message: "操作失败，请稍后重试。" });
     } finally {
@@ -247,7 +247,7 @@ export function AuthChannelsPage() {
       const result = await authApi.exportJson(account.id, path);
       const backup = result.backup_path ? `；已备份原文件：${result.backup_path}` : "";
       setNotice({ kind: "success", message: `已导出到 ${result.path}${backup}` });
-      await load();
+      await load(false);
     } catch (_) {
       setNotice({ kind: "error", message: "导出失败，请稍后重试。" });
     } finally {
@@ -262,7 +262,7 @@ export function AuthChannelsPage() {
     {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{visibleAccounts.map(account => <AccountCard key={account.id} account={account} pending={pendingId === account.id || quotaPendingId === account.id} quotaPending={quotaPendingId === account.id} onEdit={() => setEditAccount(account)} onToggle={() => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined))} onDelete={() => setConfirmation({ kind: "delete", account })} onRefresh={() => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined))} onRefreshQuota={() => void refreshQuota(account.id)} onSync={() => setSyncAccount(account)} onExport={() => void exportAuth(account)} onRelogin={() => { setReloginAccount(account); setSelectedProvider(account.provider); setShowLogin(true); }} />)}{visibleAccounts.length === 0 && <EmptyAccountSlot provider={activeProvider} onLogin={() => { setReloginAccount(null); setShowLogin(true); }} onSelectImportFormat={(format) => void importAuth(format)} busy={pendingId === "import"} />}</div>}
     {showLogin && <LoginModal provider={activeProvider} replaceAccountId={reloginAccount?.id} onClose={() => { setShowLogin(false); setReloginAccount(null); }} onCompleted={completeLogin} />}
     {editAccount && <EditModal account={editAccount} pending={pendingId === editAccount.id} onClose={() => setEditAccount(null)} onSave={async input => { await runFor(input.id, "账号配置已保存。", () => authApi.update(input).then(() => undefined)); setEditAccount(null); }} />}
-    {syncAccount && <ModelSyncModal account={syncAccount} onClose={() => setSyncAccount(null)} onSynced={() => { void load(); setNotice({ kind: "success", message: "模型同步完成。" }); }} />}
+    {syncAccount && <ModelSyncModal account={syncAccount} onClose={() => setSyncAccount(null)} onSynced={() => { void load(false); setNotice({ kind: "success", message: "模型同步完成。" }); }} />}
     {confirmation && <ConfirmationDialog confirmation={confirmation} pending={pendingId === confirmation.account.id} onCancel={() => setConfirmation(null)} onConfirm={() => void confirmAction()} />}
   </div>;
 }
