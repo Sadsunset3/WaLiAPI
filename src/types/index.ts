@@ -257,6 +257,8 @@ export interface AuthAccount {
 
 export interface AuthMutationResult {
   account: AuthAccount;
+  /** Batch-imported accounts; login flows contain the primary account only. */
+  imported_accounts?: AuthAccount[];
   warning: string | null;
   notice: string | null;
 }

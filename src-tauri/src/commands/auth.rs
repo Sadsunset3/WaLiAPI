@@ -106,6 +106,9 @@ impl TryFrom<AuthAccountSummary> for AuthAccountDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthMutationResult {
     pub account: AuthAccountDto,
+    /// All accounts persisted by a batch import. Login flows contain the
+    /// primary account only; sub2api imports populate the complete list.
+    pub imported_accounts: Vec<AuthAccountDto>,
     /// Set when persistence succeeded but the requested follow-up operation
     /// (currently initial model sync) did not.
     pub warning: Option<String>,
@@ -493,7 +496,8 @@ async fn sync_after_login(
         }
     };
     Ok(AuthMutationResult {
-        account,
+        account: account.clone(),
+        imported_accounts: vec![account.clone()],
         warning,
         notice,
     })
@@ -836,8 +840,18 @@ async fn import_and_sync(
             );
         }
     }
-    // The primary account drives the UI refresh; extra accounts appear on reload.
-    let account = AuthAccountDto::try_from(summaries[0].clone()).map_err(safe_error)?;
+    // Keep the existing primary-account field for compatibility, but also
+    // return every persisted account so batch imports can identify all rows.
+    let imported_accounts = summaries
+        .iter()
+        .cloned()
+        .map(AuthAccountDto::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(safe_error)?;
+    let account = imported_accounts
+        .first()
+        .cloned()
+        .ok_or_else(|| "导入后未找到账号".to_owned())?;
     let mut notice = CODEX_IMPORT_NOTICE.to_owned();
     if summaries.len() > 1 || skipped > 0 {
         notice = format!(
@@ -851,7 +865,8 @@ async fn import_and_sync(
         );
     }
     Ok(AuthMutationResult {
-        account,
+        account: account.clone(),
+        imported_accounts,
         warning,
         notice: Some(notice),
     })
@@ -1095,6 +1110,7 @@ mod tests {
         let list = serde_json::to_string(&vec![dto.clone()]).unwrap();
         let mutation = serde_json::to_string(&AuthMutationResult {
             account: dto,
+            imported_accounts: vec![],
             warning: None,
             notice: None,
         })

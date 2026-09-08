@@ -25,6 +25,17 @@ function optionLabel(format: ImportFormat) {
   return IMPORT_OPTIONS.find((option) => option.format === format)?.label ?? "Codex auth.json";
 }
 
+function importAccountLabel(account: AuthAccount) {
+  return account.email || account.label || account.account_id;
+}
+
+function importSuccessMessage(result: AuthMutationResult, fallback: string) {
+  const imported = result.imported_accounts ?? [result.account];
+  if (imported.length <= 1) return result.notice || fallback;
+  const labels = imported.map(importAccountLabel).join("、");
+  return `${result.notice || `成功导入 ${imported.length} 个账号。`} 导入账号：${labels}`;
+}
+
 /// 「导入」触发按钮 + 三格式下拉菜单。头部与空状态卡片共用，
 /// 各自持有打开状态并在点击外部时收起。
 function ImportDropdown({ busy, onSelect }: { busy: boolean; onSelect: (format: ImportFormat) => void }) {
@@ -77,6 +88,7 @@ export function AuthChannelsPage() {
   const [syncAccount, setSyncAccount] = useState<AuthAccount | null>(null);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [notice, setNotice] = useState<{ kind: "success" | "error" | "warning"; message: string } | null>(null);
+  const [channelTabRefreshKey, setChannelTabRefreshKey] = useState(0);
 
   useEffect(() => {
     let disposed = false;
@@ -146,8 +158,9 @@ export function AuthChannelsPage() {
       setPendingId("import"); setNotice({ kind: "success", message: "正在导入 …" });
       try {
         const result = await authApi.loginImportContent("codex", content, format);
-        setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: result.notice || "已导入账号。" });
+        setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: importSuccessMessage(result, "已导入账号。") });
         await load();
+        setChannelTabRefreshKey((key) => key + 1);
       } catch (_) {
         setNotice({ kind: "error", message: `导入失败，请确认所选文件是有效的${optionLabel(format)}。` });
       } finally { setPendingId(null); }
@@ -179,8 +192,9 @@ export function AuthChannelsPage() {
     setPendingId("import"); setNotice({ kind: "success", message: `正在读取 ${label} …` });
     try {
       const result = await authApi.loginImport("codex", path, format);
-      setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: result.notice || `已从 ${label} 导入账号。` });
+      setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: importSuccessMessage(result, `已从 ${label} 导入账号。`) });
       await load();
+      setChannelTabRefreshKey((key) => key + 1);
     } catch (_) {
       setNotice({ kind: "error", message: `导入失败，请确认所选文件是有效的${optionLabel(format)}。` });
     } finally { setPendingId(null); }
@@ -241,7 +255,7 @@ export function AuthChannelsPage() {
     }
   };
 
-  return <div className="page-shell space-y-3"><div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 flex-col bg-card/90 px-7 pt-3 backdrop-blur-md"><div className="flex w-full items-start justify-between gap-4 pb-1.5"><div><h1 className="page-title">渠道管理</h1><p className="page-subtitle mt-0.5">登录各厂商订阅账号，作为上游路由候选</p></div><div className="flex items-center gap-2"><button onClick={() => { setReloginAccount(null); setShowLogin(true); }} disabled={pendingId === "import"} className="action-primary"><KeyRound size={16} />登录账号</button>{activeProvider.supportsImport && <ImportDropdown busy={pendingId === "import"} onSelect={(format) => void importAuth(format)} />}</div></div><ChannelTabs /></div>
+  return <div className="page-shell space-y-3"><div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 flex-col bg-card/90 px-7 pt-3"><div className="flex w-full items-start justify-between gap-4 pb-1.5"><div><h1 className="page-title">渠道管理</h1><p className="page-subtitle mt-0.5">登录各厂商订阅账号，作为上游路由候选</p></div><div className="flex items-center gap-2"><button onClick={() => { setReloginAccount(null); setShowLogin(true); }} disabled={pendingId === "import"} className="action-primary"><KeyRound size={16} />登录账号</button>{activeProvider.supportsImport && <ImportDropdown busy={pendingId === "import"} onSelect={(format) => void importAuth(format)} />}</div></div><ChannelTabs refreshKey={channelTabRefreshKey} /></div>
     {notice && <div role="status" className={`flex items-center justify-between gap-3 rounded-2xl border px-4 py-3 text-sm ${notice.kind === "error" ? "border-destructive/25 bg-destructive/10 text-destructive" : notice.kind === "warning" ? "border-warning/25 bg-warning/10 text-warning" : "border-success/25 bg-success/10 text-success"}`}><span>{notice.message}</span><button onClick={() => setNotice(null)} aria-label="关闭提示"><X size={16} /></button></div>}
     <ProviderPills selected={selectedProvider} onSelect={setSelectedProvider} /><p className="text-sm text-muted-foreground">登录后作为路由候选并消耗订阅额度；开启 Auth 账号优先后，将优先使用。</p>
     <div className="flex gap-2 rounded-2xl border border-destructive/25 bg-destructive/10 px-4 py-3 text-xs leading-5 text-destructive"><CircleAlert className="mt-0.5 shrink-0" size={16} /><p>⚠️ 风险提示：此提供商使用的订阅 / OAuth 会话未获官方授权用于代理 / 路由器使用。账户可能被限制或封禁。使用风险自负。</p></div>
