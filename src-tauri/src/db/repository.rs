@@ -1438,6 +1438,64 @@ impl Repository {
             .await
     }
 
+    pub async fn count_log_summaries(
+        &self,
+        keyword: Option<&str>,
+        api_key_name: Option<&str>,
+        channel_name: Option<&str>,
+        model: Option<&str>,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        trace_id: Option<&str>,
+        upstream_type: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let mut q = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM request_logs WHERE 1=1");
+        if let Some(kw) = keyword {
+            let pattern = format!("%{}%", kw);
+            q.push(" AND (api_key_name LIKE ")
+                .push_bind(pattern.clone());
+            q.push(" OR channel_name LIKE ").push_bind(pattern.clone());
+            q.push(" OR model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ")
+                .push_bind(pattern.clone());
+            q.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
+            q.push(" OR id LIKE ").push_bind(pattern);
+            q.push(")");
+        }
+        for (column, value) in [
+            ("api_key_name", api_key_name),
+            ("channel_name", channel_name),
+        ] {
+            if let Some(value) = value {
+                q.push(" AND ")
+                    .push(column)
+                    .push(" LIKE ")
+                    .push_bind(format!("%{}%", value));
+            }
+        }
+        if let Some(value) = model {
+            let pattern = format!("%{}%", value);
+            q.push(" AND (model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ").push_bind(pattern);
+            q.push(")");
+        }
+        if let Some(value) = date_from {
+            q.push(" AND created_at >= ").push_bind(value);
+        }
+        if let Some(value) = date_to {
+            q.push(" AND created_at <= ").push_bind(value);
+        }
+        if let Some(value) = trace_id {
+            q.push(" AND trace_id LIKE ")
+                .push_bind(format!("%{}%", value));
+        }
+        if let Some(value) = upstream_type {
+            q.push(" AND upstream_type = ").push_bind(value);
+        }
+        let (count,): (i64,) = q.build_query_as().fetch_one(&self.pool).await?;
+        Ok(count)
+    }
+
     pub async fn search_logs(
         &self,
         keyword: Option<&str>,

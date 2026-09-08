@@ -98,6 +98,8 @@ export interface GetLogsInput {
 export const logApi = {
   /** 列表接口只返回摘要；正文由 get 按日志展开时懒加载。 */
   getAll: (input?: GetLogsInput) => invoke<RequestLog[]>("get_logs", { input: input || {} }),
+  /** 与 getAll 相同过滤条件下的日志总数，用于分页页码展示。 */
+  count: (input?: GetLogsInput) => invoke<number>("count_logs", { input: input || {} }),
   get: (id: string) => invoke<RequestLog>("get_log", { id }),
   getSecurityFindings: (logId: string) => invoke<SecurityFinding[]>("get_log_security_findings", { logId }),
   getStats: (days?: number) => invoke<LogStats[]>("get_log_stats", { days }),

@@ -303,6 +303,7 @@ pub fn run() {
             commands::auth::auth_quota_status,
             commands::auth::auth_update,
             commands::log::get_logs,
+            commands::log::count_logs,
             commands::log::get_log,
             commands::log::get_log_security_findings,
             commands::log::delete_log,

@@ -30,6 +30,16 @@ export function SettingsPage() {
     return hash || "security";
   });
 
+  // 监听 URL hash 变化（如从日志页「前往设置」跳转），同步切换 Tab
+  useEffect(() => {
+    const onHashChange = () => {
+      const hash = window.location.hash.replace("#", "");
+      if (hash) setActiveTab(hash);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
   useEffect(() => {
     settingsApi.get().then(setSettings).catch(() => {});
     securityApi.getBuiltinRules().then(setBuiltinRules).catch(() => {});

@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import { Link } from "react-router-dom";
 import { logApi } from "../lib/api";
 import type { RequestLog, SecurityFinding } from "../types";
 import { formatTime, formatDuration, formatNumber } from "../lib/constants";
@@ -190,6 +191,7 @@ export function LogsPage() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [page, setPage] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showCleanModal, setShowCleanModal] = useState(false);
   const [showTraceColumn, setShowTraceColumn] = useState(false);
@@ -214,7 +216,7 @@ export function LogsPage() {
   const load = useCallback((p: number = 0, silent: boolean = false) => {
     if (!silent) setLoading(true);
     const seq = ++loadSeq.current;
-    logApi.getAll({
+    const input = {
       limit: PAGE_SIZE,
       offset: p * PAGE_SIZE,
       keyword: keyword || undefined,
@@ -228,10 +230,16 @@ export function LogsPage() {
       date_to: filterDateTo ? new Date(`${filterDateTo}T23:59:59.999`).toISOString() : undefined,
       trace_id: filterTraceId || undefined,
       upstream_type: filterUpstreamType || undefined,
-    })
+    };
+    logApi.getAll(input)
       .then(items => { if (seq === loadSeq.current) setLogs(items); })
       .catch(() => { if (seq === loadSeq.current) setLoadError(true); })
       .finally(() => { if (!silent && seq === loadSeq.current) setLoading(false); });
+    // 总数查询与列表并行；静默轮询时同样刷新，保证页数与最新数据一致
+    const { limit: _l, offset: _o, ...countInput } = input;
+    logApi.count(countInput)
+      .then(n => { if (seq === loadSeq.current) setTotalCount(n); })
+      .catch(() => {});
   }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId, filterUpstreamType]);
 
   // 过滤条件变化防抖 300ms 再重载（FIX-15：此前每个按键直接触发请求）。
@@ -548,25 +556,67 @@ export function LogsPage() {
               </div>
 
               {/* Pagination — fixed at bottom of table card */}
-              <div className="flex items-center justify-between border-t border-border px-4 py-2.5 bg-white/60">
-                <button
-                  onClick={() => { const p = Math.max(0, page - 1); setPage(p); load(p); }}
-                  disabled={page === 0 || loading}
-                  className="action-secondary disabled:opacity-40 disabled:cursor-not-allowed"
-                  style={{ padding: "6px 12px", fontSize: "13px" }}
-                >
-                  上一页
-                </button>
-                <span className="text-sm text-muted-foreground">第 {page + 1} 页</span>
-                <button
-                  onClick={() => { const p = page + 1; setPage(p); load(p); }}
-                  disabled={logs.length < PAGE_SIZE || loading}
-                  className="action-secondary disabled:opacity-40 disabled:cursor-not-allowed"
-                  style={{ padding: "6px 12px", fontSize: "13px" }}
-                >
-                  下一页
-                </button>
-              </div>
+              {(() => {
+                const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+                const current = Math.min(page, totalPages - 1);
+                // 生成可点击页码：首尾页 + 当前页附近 ±2，其余折叠为省略号
+                const items: (number | "…")[] = [];
+                for (let i = 0; i < totalPages; i++) {
+                  if (i === 0 || i === totalPages - 1 || Math.abs(i - current) <= 2) {
+                    items.push(i);
+                  } else if (items[items.length - 1] !== "…") {
+                    items.push("…");
+                  }
+                }
+                const goto = (p: number) => {
+                  const target = Math.min(Math.max(0, p), totalPages - 1);
+                  setPage(target);
+                  load(target);
+                };
+                return (
+                  <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-2.5 bg-white/60">
+                    <span className="text-sm text-muted-foreground whitespace-nowrap">
+                      共 {formatNumber(totalCount)} 条 · 第 {current + 1} / {totalPages} 页
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => goto(current - 1)}
+                        disabled={current === 0 || loading}
+                        className="action-secondary disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ padding: "6px 12px", fontSize: "13px" }}
+                      >
+                        上一页
+                      </button>
+                      {items.map((item, idx) =>
+                        item === "…" ? (
+                          <span key={`ellipsis-${idx}`} className="px-1.5 text-sm text-muted-foreground select-none">…</span>
+                        ) : (
+                          <button
+                            key={item}
+                            onClick={() => goto(item)}
+                            disabled={loading}
+                            className={`min-w-[30px] rounded-md px-1.5 py-1 text-[13px] transition-colors disabled:cursor-not-allowed ${
+                              item === current
+                                ? "bg-primary text-white font-medium"
+                                : "text-muted-foreground hover:bg-slate-100 hover:text-foreground"
+                            }`}
+                          >
+                            {item + 1}
+                          </button>
+                        ),
+                      )}
+                      <button
+                        onClick={() => goto(current + 1)}
+                        disabled={current >= totalPages - 1 || loading}
+                        className="action-secondary disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ padding: "6px 12px", fontSize: "13px" }}
+                      >
+                        下一页
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </>
           )}
         </div>
@@ -695,6 +745,9 @@ function LogRow({
               ) : log.detail_available === false || (!log.request_body && log.detail_level === "basic") ? (
                 <div className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-800">
                   该记录使用“基本”日志级别，未保存请求与响应正文；网络状态、渠道、模型、推理档位、响应码和 Token 等摘要信息仍可查看。
+                  <Link to="/settings#general" className="ml-2 inline-flex items-center gap-0.5 font-semibold text-indigo-600 underline decoration-indigo-300 underline-offset-2 transition-colors hover:text-indigo-800 hover:decoration-indigo-500">
+                    前往「设置 → 通用设置」开启详细日志级别
+                  </Link>
                 </div>
               ) : (
                 <div className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-800">

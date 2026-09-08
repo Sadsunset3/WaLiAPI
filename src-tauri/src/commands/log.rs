@@ -257,6 +257,33 @@ pub async fn get_logs_impl(
 }
 
 #[tauri::command]
+pub async fn count_logs(
+    input: GetLogsInput,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<i64, String> {
+    count_logs_impl(input, &*state).await
+}
+
+pub async fn count_logs_impl(
+    input: GetLogsInput,
+    state: &std::sync::Arc<AppState>,
+) -> Result<i64, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.count_log_summaries(
+        input.keyword.as_deref(),
+        input.api_key_name.as_deref(),
+        input.channel_name.as_deref(),
+        input.model.as_deref(),
+        input.date_from.as_deref(),
+        input.date_to.as_deref(),
+        input.trace_id.as_deref(),
+        input.upstream_type.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_log(
     id: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
