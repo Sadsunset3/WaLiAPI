@@ -1237,6 +1237,9 @@ fn update_stream_snapshot(
 #[derive(Clone)]
 struct StreamLogFinalizer {
     repo: Arc<Repository>,
+    /// 预生成的日志行 id：Responses 逐帧持久化在流开始前就用它写段表，
+    /// 落账行必须与段表同一个 id（续传回放按它关联完成状态）。
+    log_id: String,
     key: ApiKey,
     audited: AuditedRequest,
     model: String,
@@ -1290,7 +1293,7 @@ impl StreamLogFinalizer {
         }
         let duration_ms = self.started.elapsed().as_millis() as i64;
         let log = RequestLog {
-            id: utils::id::new_id(),
+            id: self.log_id.clone(),
             seq: None,
             api_key_id: Some(self.key.id.clone()),
             api_key_name: Some(self.key.name.clone()),
@@ -1485,8 +1488,16 @@ fn stream_response_body(
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let mode_for_error = mode.clone();
     let snapshot = std::sync::Arc::new(std::sync::Mutex::new(StreamSnapshot::default()));
+    // Responses 逐帧持久化（续传锚点）：detailed 策略下，下游每帧 SSE 字节
+    // 顺序落段表（seq 递增，response.id 从 response.created 帧提取）。
+    // 客户端中途断开时已生成帧自然保留——「丢了」变成「可回放」。
+    let resume_frames_enabled = mode_for_error == "responses"
+        && crate::audit_log::current_policy().detail_level
+            == crate::audit_log::LogDetailLevel::Detailed;
+    let resume_log_id = utils::id::new_id();
     let finalizer = StreamLogFinalizer {
-        repo,
+        repo: repo.clone(),
+        log_id: resume_log_id.clone(),
         key,
         audited,
         model,
@@ -1515,6 +1526,9 @@ fn stream_response_body(
         let mut error_message: Option<String> = None;
         // 终止帧 / 错误帧交给下游之前就已经落库时为 true，函数末尾不再重复写日志。
         let mut finalized = false;
+        // Responses 逐帧持久化状态：帧序号 + 续传锚点（response.created 提取）
+        let mut frame_seq: i64 = 0;
+        let mut anchor_response_id: Option<String> = None;
 
         let upstream_bytes = upstream.body;
         tokio::pin!(upstream_bytes);
@@ -1530,6 +1544,16 @@ fn stream_response_body(
                 // 否则取消行丢内容、FIX-16 响应扫描拿到空快照。
                 update_stream_snapshot(&snapshot, &pump);
                 if !first.is_empty() {
+                    if resume_frames_enabled {
+                        persist_resume_frame(
+                            &repo,
+                            &resume_log_id,
+                            &mut frame_seq,
+                            &mut anchor_response_id,
+                            &first,
+                        )
+                        .await;
+                    }
                     if !finalized && downstream_terminal_frame(&mode_for_error, &first) {
                         finalized = true;
                         write_stream_log(
@@ -1579,6 +1603,16 @@ fn stream_response_body(
                         // 每帧后同步取消路径要用的落账快照（#57）。
                         update_stream_snapshot(&snapshot, &pump);
                         if !out.is_empty() {
+                            if resume_frames_enabled {
+                                persist_resume_frame(
+                                    &repo,
+                                    &resume_log_id,
+                                    &mut frame_seq,
+                                    &mut anchor_response_id,
+                                    &out,
+                                )
+                                .await;
+                            }
                             if !finalized && downstream_terminal_frame(&mode_for_error, &out) {
                                 finalized = true;
                                 write_stream_log(
@@ -1782,6 +1816,54 @@ fn downstream_terminal_frame(mode: &str, out: &[u8]) -> bool {
                 .is_some_and(|payload| payload.trim() == "[DONE]")
         }
     })
+}
+
+/// 从下游 SSE 帧字节中提取续传锚点（response.created 事件里的 response.id）。
+/// 纯函数：只认 `data:` 行的 JSON，`type == "response.created"` 时取 `response.id`。
+fn extract_response_id(frame: &str) -> Option<String> {
+    for line in frame.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) == Some("response.created") {
+            if let Some(id) = value
+                .get("response")
+                .and_then(|r| r.get("id"))
+                .and_then(|id| id.as_str())
+            {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Responses 逐帧持久化：一帧下游 SSE 字节顺序写入段表（best-effort）。
+/// 首次见到 response.created 帧时提取锚点；此前已写入的帧锚点为 NULL
+/// （实际首帧即 response.created，NULL 帧仅出现在上游乱序的病态场景）。
+async fn persist_resume_frame(
+    repo: &Repository,
+    log_id: &str,
+    seq: &mut i64,
+    anchor: &mut Option<String>,
+    frame: &[u8],
+) {
+    let text = String::from_utf8_lossy(frame);
+    if anchor.is_none() {
+        *anchor = extract_response_id(&text);
+    }
+    *seq += 1;
+    repo.append_stream_frame(
+        log_id,
+        *seq,
+        anchor.as_deref(),
+        &text,
+        &crate::utils::time::now_iso(),
+    )
+    .await;
 }
 
 /// Walk an error's `source()` chain to its root and return it as a string.
@@ -2372,6 +2454,191 @@ mod tests {
             created_at: now(),
             updated_at: now(),
         }
+    }
+
+    // ─── C-03 第二档：Responses 逐帧持久化（续传锚点）────────────────────
+
+    fn responses_upstream(terminated: bool) -> UpstreamStream {
+        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(
+            bytes::Bytes::from_static(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test_42\",\"status\":\"in_progress\"}}\n\n",
+            ),
+        )];
+        let mut second = String::from(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+        );
+        if terminated {
+            second.push_str("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test_42\",\"status\":\"completed\"}}\n\n");
+        }
+        chunks.push(Ok(bytes::Bytes::from(second)));
+        let body = futures_util::stream::iter(chunks)
+            .chain(futures_util::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >())
+            .boxed();
+        UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        }
+    }
+
+    async fn pump_for_responses(upstream: &mut UpstreamStream) -> StreamPumpCore {
+        let (first_frame, carry) = buffer_first_record(upstream).await.unwrap();
+        let mut sup = crate::core::stream_supervisor::StreamSupervisor::new();
+        sup.begin_connect().unwrap();
+        sup.on_upstream_headers().unwrap();
+        sup.on_first_frame_validated().unwrap();
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Responses,
+            crate::protocol::codec::Protocol::Responses,
+            "up-model",
+            &json!({"model":"up-model", "input":"hi"}),
+        )
+        .unwrap();
+        StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry).unwrap()
+    }
+
+    /// 正常完成的 Responses 流：全部帧按序落段，锚点（response.id）可反查，
+    /// 段表 log_id 与落账行 id 一致（续传回放据此判定完成状态）。
+    #[tokio::test]
+    async fn responses_stream_persists_frames_progressively() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = responses_upstream(true);
+        let pump = pump_for_responses(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "responses".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "openai".to_string(),
+            1,
+            "responses_g1_native".to_string(),
+            None,
+            "responses".to_string(),
+            "responses".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+
+        let frames = repo
+            .get_stream_frames_after("resp_test_42", 0)
+            .await
+            .unwrap();
+        assert!(!frames.is_empty(), "完成流应落全部帧");
+        let joined: String = frames.iter().map(|(_, f)| f.as_str()).collect();
+        assert!(joined.contains("response.created"));
+        assert!(joined.contains("response.output_text.delta"));
+        assert!(joined.contains("response.completed"), "终止帧应已持久化");
+
+        // 锚点反查 → 段表 log_id == 落账行 id
+        let (anchor_log_id, _) = repo
+            .find_stream_anchor("resp_test_42")
+            .await
+            .unwrap()
+            .expect("锚点应可反查");
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        let row = logs.first().expect("完成流应有落账行");
+        assert_eq!(row.id, anchor_log_id, "段表与落账行必须同一 log_id");
+
+        // offset 语义：跳过 seq<=1 的帧
+        let tail = repo
+            .get_stream_frames_after("resp_test_42", 1)
+            .await
+            .unwrap();
+        assert!(!tail.iter().any(|(_, f)| f.contains("response.created")));
+    }
+
+    /// 客户端中断的 Responses 流：已生成帧保留（回放可用），无终止帧，
+    /// 499 取消行照常落账（既有取消语义不变）。
+    #[tokio::test]
+    async fn responses_cancel_keeps_persisted_frames_for_replay() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = responses_upstream(false);
+        let pump = pump_for_responses(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "responses".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "openai".to_string(),
+            1,
+            "responses_g1_native".to_string(),
+            None,
+            "responses".to_string(),
+            "responses".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+        stream.next().await.unwrap().unwrap();
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+
+        // 499 取消行（Drop spawn 异步写）
+        let mut cancelled = false;
+        for _ in 0..100 {
+            let logs = repo.get_logs(10, 0).await.unwrap();
+            if logs.first().is_some_and(|row| row.status_code == 499) {
+                cancelled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(cancelled, "取消行必须照常落账");
+
+        let frames = repo
+            .get_stream_frames_after("resp_test_42", 0)
+            .await
+            .unwrap();
+        let joined: String = frames.iter().map(|(_, f)| f.as_str()).collect();
+        assert!(
+            joined.contains("response.output_text.delta"),
+            "中断前帧应保留"
+        );
+        assert!(
+            !joined.contains("response.completed"),
+            "中断流不应有终止帧（回放端点据此合成 incomplete 收尾）"
+        );
+    }
+
+    #[test]
+    fn extract_response_id_parses_created_event_only() {
+        let created =
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\",\"status\":\"in_progress\"}}\n\n";
+        assert_eq!(extract_response_id(created), Some("resp_x".to_string()));
+        // 非 created 事件不提取；data 无空格前缀可解析；坏 JSON 跳过
+        let delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\",\"response\":{\"id\":\"resp_y\"}}\n\n";
+        assert_eq!(extract_response_id(delta), None);
+        assert_eq!(extract_response_id("data: not-json\n\n"), None);
+        assert_eq!(
+            extract_response_id(
+                "event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+            ),
+            None
+        );
     }
 
     /// C-1: the FULL `stream_response_body` emission seam.  The first upstream

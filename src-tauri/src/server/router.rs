@@ -103,6 +103,11 @@ fn build_router(state: Arc<AppState>, shared: SharedState) -> Router {
         .route("/v1/completions", post(handle_completions))
         // OpenAI Responses API
         .route("/v1/responses", post(handle_responses))
+        // Responses 断线续传回放（逐帧持久化的已生成内容，offset 起回放）
+        .route(
+            "/v1/responses/{id}/events",
+            get(super::handlers::handle_responses_events),
+        )
         // OpenAI Embeddings
         .route("/v1/embeddings", post(handle_embeddings))
         // OpenAI Models
@@ -324,6 +329,154 @@ mod tests {
         // 数据面 /health 不受服务 token 影响
         let res = app.oneshot(request("GET", "/health", None)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ─── C-03 第二档：Responses 续传回放端点 ─────────────────────────────
+
+    async fn seed_replay_state(
+        state: &Arc<AppState>,
+        key: &str,
+        response_id: &str,
+        created_at: &str,
+        with_frames: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, key, created_at, updated_at) \
+             VALUES ('rk-1', 'replay-test', ?, ?, ?)",
+        )
+        .bind(key)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        if with_frames {
+            let repo = crate::db::repository::Repository::new(state.db.pool.clone());
+            repo.append_stream_frame(
+                "log-rt-1",
+                1,
+                Some(response_id),
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\",\"status\":\"in_progress\"}}\n\n",
+                created_at,
+            )
+            .await;
+            repo.append_stream_frame(
+                "log-rt-1",
+                2,
+                Some(response_id),
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"部分\"}\n\n",
+                created_at,
+            )
+            .await;
+        }
+    }
+
+    fn replay_request(uri: &str, key: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("x-api-key", key)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn body_string(res: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn responses_replay_replays_frames_and_synthesizes_incomplete_tail() {
+        let state = test_state().await;
+        seed_replay_state(
+            &state,
+            "sk-rt-1",
+            "resp_rt_1",
+            "2026-09-09T00:00:00+00:00",
+            true,
+        )
+        .await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        // 未带 key → 401
+        let res = app
+            .clone()
+            .oneshot(replay_request(
+                "/v1/responses/resp_rt_1/events",
+                "wrong-key",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 回放：两帧 + 合成 incomplete 终止帧（原流无终止帧）
+        let res = app
+            .clone()
+            .oneshot(replay_request("/v1/responses/resp_rt_1/events", "sk-rt-1"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = body_string(res).await;
+        assert!(body.contains("response.created"));
+        assert!(body.contains("response.output_text.delta"));
+        assert!(
+            body.contains("\"status\":\"incomplete\"") && body.contains("response.completed"),
+            "中断流回放应合成 incomplete 完成帧收尾"
+        );
+
+        // offset 语义：跳过 seq<=1
+        let res = app
+            .clone()
+            .oneshot(replay_request(
+                "/v1/responses/resp_rt_1/events?offset=1",
+                "sk-rt-1",
+            ))
+            .await
+            .unwrap();
+        let body = body_string(res).await;
+        assert!(!body.contains("response.created"), "offset=1 应跳过首帧");
+        assert!(body.contains("response.output_text.delta"));
+    }
+
+    #[tokio::test]
+    async fn responses_replay_unknown_id_and_expired_window() {
+        let state = test_state().await;
+        seed_replay_state(
+            &state,
+            "sk-rt-2",
+            "resp_rt_2",
+            "2020-01-01T00:00:00+00:00",
+            true,
+        )
+        .await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        // 未知 id → 404
+        let res = app
+            .clone()
+            .oneshot(replay_request("/v1/responses/nope/events", "sk-rt-2"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // 首帧时间超出 TTL（默认 24h）→ 410 明确「续传已过期」
+        let res = app
+            .oneshot(replay_request("/v1/responses/resp_rt_2/events", "sk-rt-2"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let body = body_string(res).await;
+        assert!(body.contains("expired"), "错误体应说明续传过期：{body}");
     }
 
     #[tokio::test]
