@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, CircleAlert, FileJson, KeyRound, Loader2, Upload, X } from "lucide-react";
+import { ChevronDown, CircleAlert, FileJson, KeyRound, LayoutGrid, List, Loader2, RefreshCw, Upload, X } from "lucide-react";
+import { useMemo } from "react";
 import { authApi } from "../lib/api";
 import { downloadTextFile, isWebRuntime, pickFileAsText } from "../lib/web";
 import type { AuthAccount, AuthMutationResult, AuthProviderInfo } from "../types";
 import { AccountCard } from "../components/auth/AccountCard";
+import { AccountList } from "../components/auth/AccountList";
 import { EditModal } from "../components/auth/EditModal";
 import { LoginModal } from "../components/auth/LoginModal";
 import { ModelSyncModal } from "../components/auth/ModelSyncModal";
@@ -81,7 +83,11 @@ export function AuthChannelsPage() {
   const [selectedProvider, setSelectedProvider] = useState<string>("codex");
   const [loading, setLoading] = useState(true);
   const [pendingId, setPendingId] = useState<string | null>(null);
-  const [quotaPendingId, setQuotaPendingId] = useState<string | null>(null);
+  const [quotaPendingIds, setQuotaPendingIds] = useState<Set<string>>(new Set());
+  const [batchQuotaRefreshing, setBatchQuotaRefreshing] = useState(false);
+  const [viewMode, setViewMode] = useState<"list" | "card">(() => {
+    try { return localStorage.getItem("waliapi:auth-channel-view") === "card" ? "card" : "list"; } catch { return "list"; }
+  });
   const [showLogin, setShowLogin] = useState(false);
   const [reloginAccount, setReloginAccount] = useState<AuthAccount | null>(null);
   const [editAccount, setEditAccount] = useState<AuthAccount | null>(null);
@@ -116,7 +122,17 @@ export function AuthChannelsPage() {
   // the full list after every mutation, so a newly added account of the
   // currently selected provider appears here (kimi-auth.md §Verification:
   // "Provider filter 不隐藏新增账号后的刷新结果").
-  const visibleAccounts = accounts.filter((a) => a.provider === selectedProvider);
+  const visibleAccounts = useMemo(() => accounts
+    .filter((a) => a.provider === selectedProvider)
+    .map((account, index) => ({ account, index }))
+    .sort((a, b) => {
+      const availability = (account: AuthAccount) => account.status !== "invalid" && !account.disabled && !account.quota?.exceeded ? 1 : 0;
+      return availability(b.account) - availability(a.account)
+        || b.account.priority - a.account.priority
+        || b.account.weight - a.account.weight
+        || a.index - b.index;
+    })
+    .map(({ account }) => account), [accounts, selectedProvider]);
 
   const load = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true);
@@ -134,7 +150,7 @@ export function AuthChannelsPage() {
   };
 
   const refreshQuota = async (id: string) => {
-    setQuotaPendingId(id);
+    setQuotaPendingIds((ids) => new Set(ids).add(id));
     try {
       await authApi.refreshQuota(id);
       setNotice({ kind: "success", message: "额度刷新完成。" });
@@ -142,9 +158,53 @@ export function AuthChannelsPage() {
     } catch (_) {
       setNotice({ kind: "error", message: "额度刷新失败，已保留上次额度数据。" });
     } finally {
-      setQuotaPendingId(null);
+      setQuotaPendingIds((ids) => {
+        const next = new Set(ids);
+        next.delete(id);
+        return next;
+      });
     }
   };
+
+  const refreshVisibleQuotas = async () => {
+    const eligible = visibleAccounts.filter((account) => activeProvider.supportsQuota && account.status !== "invalid" && !account.disabled);
+    if (eligible.length === 0 || batchQuotaRefreshing) return;
+    setBatchQuotaRefreshing(true);
+    setQuotaPendingIds(new Set(eligible.map((account) => account.id)));
+    try {
+      const results = await Promise.allSettled(eligible.map((account) => authApi.refreshQuota(account.id)));
+      await load(false);
+      const succeeded = results.filter((result) => result.status === "fulfilled").length;
+      const failed = results.length - succeeded;
+      setNotice({
+        kind: failed === 0 ? "success" : "warning",
+        message: failed === 0 ? `额度刷新完成，${succeeded} 个账号已更新。` : `额度刷新完成，${succeeded} 个成功，${failed} 个失败。`,
+      });
+    } catch (_) {
+      setNotice({ kind: "error", message: "额度刷新失败，已保留上次额度数据。" });
+    } finally {
+      setQuotaPendingIds(new Set());
+      setBatchQuotaRefreshing(false);
+    }
+  };
+
+  const setAuthViewMode = (mode: "list" | "card") => {
+    setViewMode(mode);
+    try { localStorage.setItem("waliapi:auth-channel-view", mode); } catch {}
+  };
+
+  const actionFor = (account: AuthAccount) => ({
+    pending: pendingId === account.id || quotaPendingIds.has(account.id),
+    quotaPending: quotaPendingIds.has(account.id),
+    onEdit: () => setEditAccount(account),
+    onToggle: () => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined)),
+    onDelete: () => setConfirmation({ kind: "delete", account }),
+    onRefresh: () => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined)),
+    onRefreshQuota: () => void refreshQuota(account.id),
+    onSync: () => setSyncAccount(account),
+    onExport: () => void exportAuth(account),
+    onRelogin: () => { setReloginAccount(account); setSelectedProvider(account.provider); setShowLogin(true); },
+  });
 
   const completeLogin = (result: AuthMutationResult) => {
     setShowLogin(false);
@@ -260,9 +320,22 @@ export function AuthChannelsPage() {
 
   return <div className="page-shell space-y-3"><div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 flex-col bg-card/90 px-7 pt-3"><div className="flex w-full items-start justify-between gap-4 pb-1.5"><div><h1 className="page-title">渠道管理</h1><p className="page-subtitle mt-0.5">登录各厂商订阅账号，作为上游路由候选</p></div><div className="flex items-center gap-2"><button onClick={() => { setReloginAccount(null); setShowLogin(true); }} disabled={pendingId === "import"} className="action-primary"><KeyRound size={16} />登录账号</button>{activeProvider.supportsImport && <ImportDropdown busy={pendingId === "import"} onSelect={(format) => void importAuth(format)} />}</div></div><ChannelTabs refreshKey={channelTabRefreshKey} /></div>
     {notice && <div role="status" className={`flex items-center justify-between gap-3 rounded-2xl border px-4 py-3 text-sm ${notice.kind === "error" ? "border-destructive/25 bg-destructive/10 text-destructive" : notice.kind === "warning" ? "border-warning/25 bg-warning/10 text-warning" : "border-success/25 bg-success/10 text-success"}`}><span>{notice.message}</span><button onClick={() => setNotice(null)} aria-label="关闭提示"><X size={16} /></button></div>}
-    <ProviderPills selected={selectedProvider} onSelect={setSelectedProvider} /><p className="text-sm text-muted-foreground">登录后作为路由候选并消耗订阅额度；开启 Auth 账号优先后，将优先使用。</p>
+    <ProviderPills selected={selectedProvider} onSelect={setSelectedProvider} />
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <p className="text-sm text-muted-foreground">登录后作为路由候选并消耗订阅额度；开启 Auth 账号优先后，将优先使用。</p>
+      <div className="flex items-center gap-2">
+        {activeProvider.supportsQuota && <button onClick={() => void refreshVisibleQuotas()} disabled={batchQuotaRefreshing || visibleAccounts.every((account) => account.status === "invalid" || account.disabled)} className="action-secondary">
+          {batchQuotaRefreshing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+          {batchQuotaRefreshing ? `刷新额度 ${quotaPendingIds.size}/${visibleAccounts.length}` : "刷新全部额度"}
+        </button>}
+        <div className="flex items-center rounded-xl border border-border bg-card p-1" aria-label="账号视图切换">
+          <button onClick={() => setAuthViewMode("list")} className={`rounded-lg p-1.5 ${viewMode === "list" ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted"}`} title="列表视图" aria-label="列表视图" aria-pressed={viewMode === "list"}><List size={16} /></button>
+          <button onClick={() => setAuthViewMode("card")} className={`rounded-lg p-1.5 ${viewMode === "card" ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted"}`} title="卡片视图" aria-label="卡片视图" aria-pressed={viewMode === "card"}><LayoutGrid size={16} /></button>
+        </div>
+      </div>
+    </div>
     <div className="flex gap-2 rounded-2xl border border-destructive/25 bg-destructive/10 px-4 py-3 text-xs leading-5 text-destructive"><CircleAlert className="mt-0.5 shrink-0" size={16} /><p>⚠️ 风险提示：此提供商使用的订阅 / OAuth 会话未获官方授权用于代理 / 路由器使用。账户可能被限制或封禁。使用风险自负。</p></div>
-    {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{visibleAccounts.map(account => <AccountCard key={account.id} account={account} pending={pendingId === account.id || quotaPendingId === account.id} quotaPending={quotaPendingId === account.id} onEdit={() => setEditAccount(account)} onToggle={() => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined))} onDelete={() => setConfirmation({ kind: "delete", account })} onRefresh={() => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined))} onRefreshQuota={() => void refreshQuota(account.id)} onSync={() => setSyncAccount(account)} onExport={() => void exportAuth(account)} onRelogin={() => { setReloginAccount(account); setSelectedProvider(account.provider); setShowLogin(true); }} />)}{visibleAccounts.length === 0 && <EmptyAccountSlot provider={activeProvider} onLogin={() => { setReloginAccount(null); setShowLogin(true); }} onSelectImportFormat={(format) => void importAuth(format)} busy={pendingId === "import"} />}</div>}
+    {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : visibleAccounts.length === 0 ? <EmptyAccountSlot provider={activeProvider} onLogin={() => { setReloginAccount(null); setShowLogin(true); }} onSelectImportFormat={(format) => void importAuth(format)} busy={pendingId === "import"} /> : viewMode === "list" ? <AccountList accounts={visibleAccounts} actionFor={actionFor} /> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{visibleAccounts.map(account => { const actions = actionFor(account); return <AccountCard key={account.id} account={account} pending={actions.pending} quotaPending={actions.quotaPending} onEdit={actions.onEdit} onToggle={actions.onToggle} onDelete={actions.onDelete} onRefresh={actions.onRefresh} onRefreshQuota={actions.onRefreshQuota} onSync={actions.onSync} onExport={actions.onExport} onRelogin={actions.onRelogin} />; })}</div>}
     {showLogin && <LoginModal provider={activeProvider} replaceAccountId={reloginAccount?.id} onClose={() => { setShowLogin(false); setReloginAccount(null); }} onCompleted={completeLogin} />}
     {editAccount && <EditModal account={editAccount} pending={pendingId === editAccount.id} onClose={() => setEditAccount(null)} onSave={async input => { await runFor(input.id, "账号配置已保存。", () => authApi.update(input).then(() => undefined)); setEditAccount(null); }} />}
     {syncAccount && <ModelSyncModal account={syncAccount} onClose={() => setSyncAccount(null)} onSynced={() => { void load(false); setNotice({ kind: "success", message: "模型同步完成。" }); }} />}
