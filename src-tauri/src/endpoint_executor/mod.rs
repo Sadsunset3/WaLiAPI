@@ -201,6 +201,9 @@ pub async fn dispatch_auth_account_executor(
                 })
             }
         };
+        if let Some(failure) = semantic_failure(&attempt.upstream_protocol, &body) {
+            return AttemptResult::Failure(failure);
+        }
         return match decode_non_stream(downstream, attempt, &body) {
             Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
                 status,
@@ -249,6 +252,9 @@ pub async fn dispatch_auth_account_executor(
         Ok(body) => body,
         Err(error) => return AttemptResult::Failure(responses_protocol_failure(error.message)),
     };
+    if let Some(failure) = semantic_failure(&attempt.upstream_protocol, &body) {
+        return AttemptResult::Failure(failure);
+    }
     match decode_non_stream(downstream, attempt, &body) {
         Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
             status,
@@ -566,34 +572,82 @@ pub fn classify_upstream_status(status: u16, body: &str) -> Option<FailureClass>
     crate::core::attempt::classify_http_status_with_body(status, Some(body))
 }
 
-/// Detect an Anthropic error envelope even when a compatible gateway returns
-/// HTTP 2xx.  Several Claude gateways encode capacity/overload as
-/// `{"type":"error","error":{...}}` with a successful transport status.
-/// Keep this parser deliberately conservative: ordinary successful Messages
-/// responses have `type=message` and are never classified as errors.
-pub fn anthropic_error_envelope_message(body: &Value) -> Option<String> {
-    let is_error = body.get("type").and_then(Value::as_str) == Some("error")
-        || body
-            .get("error")
-            .is_some_and(|error| error.is_object() || error.is_string());
-    if !is_error {
+/// 将 HTTP 2xx 中的协议失败统一收敛到这里。这个函数只接受已读完的
+/// JSON/SSE data，绝不消费无界流；调用者仍负责 HTTP 状态分类。
+///
+/// 不以任意 `message` 中出现 error 为依据。必须是协议规定的 error shape，
+/// 才会在下游提交前触发故障转移。
+pub fn semantic_failure(protocol: &str, body: &Value) -> Option<AttemptFailure> {
+    let response_status = body.get("status").and_then(Value::as_str);
+    let responses_failed =
+        protocol == "openai" && matches!(response_status, Some("failed") | Some("cancelled"));
+    let anthropic_error = protocol == "anthropic"
+        && (body.get("type").and_then(Value::as_str) == Some("error")
+            || body.get("error").is_some_and(|v| !v.is_null()));
+    // OpenAI-compatible providers conventionally use a top-level non-null
+    // error object. A normal Chat/Responses success does not have this shape.
+    let openai_error = protocol != "anthropic" && body.get("error").is_some_and(|v| !v.is_null());
+    if !(responses_failed || anthropic_error || openai_error) {
         return None;
     }
-    let error = body.get("error").unwrap_or(body);
+    let error = body.get("error").filter(|v| !v.is_null()).unwrap_or(body);
     let kind = error
         .get("type")
         .and_then(Value::as_str)
         .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or("error");
+        .or_else(|| body.get("type").and_then(Value::as_str))
+        .unwrap_or("upstream_error");
     let message = error
         .get("message")
         .and_then(Value::as_str)
+        .or_else(|| body.get("message").and_then(Value::as_str))
         .or_else(|| error.as_str())
-        .unwrap_or("Anthropic upstream returned an error")
+        .unwrap_or("upstream returned a semantic error")
         .chars()
         .take(300)
         .collect::<String>();
-    Some(format!("{kind}: {message}"))
+    let retry_after = error
+        .get("retry_after")
+        .and_then(|v| v.as_u64())
+        .or_else(|| body.get("retry_after").and_then(|v| v.as_u64()))
+        .map(|seconds| seconds.min(RETRY_AFTER_CAP_SECS));
+    let haystack = format!(
+        "{} {}",
+        kind.to_ascii_lowercase(),
+        message.to_ascii_lowercase()
+    );
+    let failure_class = if haystack.contains("invalid_api_key")
+        || haystack.contains("authentication")
+        || haystack.contains("unauthorized")
+        || haystack.contains("permission_denied")
+    {
+        FailureClass::ChannelAuthTerminal
+    } else if haystack.contains("invalid_request")
+        || haystack.contains("invalid model")
+        || haystack.contains("unsupported parameter")
+    {
+        FailureClass::CallerTerminal
+    } else {
+        // overload/rate-limit have the same routing result as provider-side
+        // temporary failures: retry another credential/candidate.
+        FailureClass::Retryable
+    };
+    Some(AttemptFailure {
+        failure_class,
+        message: format!("{kind}: {message}"),
+        status_code: Some(if failure_class == FailureClass::CallerTerminal {
+            400
+        } else {
+            502
+        }),
+        retry_after,
+    })
+}
+
+/// Backwards-compatible Anthropic helper retained for the existing callers and
+/// tests. New code should use [`semantic_failure`].
+pub fn anthropic_error_envelope_message(body: &Value) -> Option<String> {
+    semantic_failure("anthropic", body).map(|failure| failure.message)
 }
 
 /// Parse a bounded response body and detect an Anthropic error envelope.
@@ -601,6 +655,50 @@ pub fn anthropic_error_envelope_from_bytes(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|value| anthropic_error_envelope_message(&value))
+}
+
+/// Inspect a complete upstream SSE record before any downstream byte is sent.
+/// It supports multi-line `data:` fields and both event-name and JSON shapes.
+pub fn semantic_stream_failure(protocol: &str, record: &[u8]) -> Option<AttemptFailure> {
+    let text = std::str::from_utf8(record).ok()?;
+    let event = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("event:").map(str::trim));
+    let data = text
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if protocol == "anthropic" && event == Some("error") {
+        return serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|value| semantic_failure(protocol, &value))
+            .or_else(|| {
+                Some(AttemptFailure {
+                    failure_class: FailureClass::Retryable,
+                    message: "Anthropic upstream stream error".to_string(),
+                    status_code: Some(502),
+                    retry_after: None,
+                })
+            });
+    }
+    if protocol == "openai" && matches!(event, Some("response.failed") | Some("response.cancelled"))
+    {
+        return serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|value| semantic_failure(protocol, value.get("response").unwrap_or(&value)))
+            .or_else(|| {
+                Some(AttemptFailure {
+                    failure_class: FailureClass::Retryable,
+                    message: "Responses upstream stream failed before output".to_string(),
+                    status_code: Some(502),
+                    retry_after: None,
+                })
+            });
+    }
+    serde_json::from_str::<Value>(&data)
+        .ok()
+        .and_then(|value| semantic_failure(protocol, &value))
 }
 
 /// Inspect one complete Anthropic SSE record for an error event/envelope.
@@ -1015,21 +1113,9 @@ pub async fn dispatch_executor(
             }
         }
     };
-    if attempt.upstream_protocol == "anthropic"
-        && (200..300).contains(&status)
-        && anthropic_error_envelope_message(&body).is_some()
-    {
-        let message = anthropic_error_envelope_message(&body)
-            .unwrap_or_else(|| "Anthropic upstream returned a 2xx error envelope".to_string());
-        return AttemptResult::Failure(AttemptFailure {
-            failure_class: FailureClass::Retryable,
-            message,
-            // A 2xx transport carrying an error envelope is not a successful
-            // downstream response.  Expose the gateway failure status while
-            // retaining the original body message for diagnostics.
-            status_code: Some(502),
-            retry_after,
-        });
+    if let Some(mut failure) = semantic_failure(&attempt.upstream_protocol, &body) {
+        failure.retry_after = retry_after;
+        return AttemptResult::Failure(failure);
     }
     // Legacy Gemini override: the upstream `generateContent` response must be
     // converted back to OpenAI Chat (this is the ONLY executor that converts
@@ -1345,6 +1431,34 @@ mod tests {
             anthropic_stream_error_message(record).as_deref(),
             Some("overloaded_error: busy")
         );
+    }
+
+    #[test]
+    fn semantic_failure_covers_responses_and_openai_compatible_shapes() {
+        let failed =
+            serde_json::json!({"status":"failed","error":{"code":"server_error","message":"busy"}});
+        assert_eq!(
+            semantic_failure("openai", &failed).unwrap().failure_class,
+            FailureClass::Retryable
+        );
+        let cancelled = serde_json::json!({"status":"cancelled"});
+        assert!(semantic_failure("openai", &cancelled).is_some());
+        let compat = serde_json::json!({"error":{"type":"rate_limit_error","message":"slow down"}});
+        assert_eq!(
+            semantic_failure("openai", &compat).unwrap().failure_class,
+            FailureClass::Retryable
+        );
+        let success = serde_json::json!({"object":"chat.completion","message":"error text"});
+        assert!(semantic_failure("openai", &success).is_none());
+    }
+
+    #[test]
+    fn responses_failed_sse_envelope_is_detected() {
+        let record = br#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"message":"capacity"}}}
+
+"#;
+        assert!(semantic_stream_failure("openai", record).is_some());
     }
 
     #[test]

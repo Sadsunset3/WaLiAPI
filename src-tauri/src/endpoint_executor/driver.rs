@@ -73,21 +73,20 @@ fn extract_reasoning_effort(audited: &AuditedRequest) -> Option<String> {
     }
 }
 
-/// Multi-key load balancing: if the channel has extra API keys in
-/// `channel_api_keys`, randomly select one weighted by `weight`. The
-/// primary `api_key` on the channel row always participates with its
-/// channel-level `weight`. Returns the channel unchanged on error or when
-/// no extra keys exist.
-async fn select_channel_key(channel: &Channel, repo: &Arc<Repository>) -> Channel {
+/// Freeze the enabled credential slots for one request and order them by
+/// weighted sampling without replacement.  The returned `Channel` copies are
+/// intentionally request-local: credential values never enter PreparedAttempt,
+/// request logs, or tracing fields.
+async fn channel_key_slots(channel: &Channel, repo: &Arc<Repository>) -> Vec<Channel> {
     let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
         Ok(keys) => keys
             .into_iter()
             .filter(|k| k.status == 1)
             .collect::<Vec<_>>(),
-        Err(_) => return channel.clone(),
+        Err(_) => return vec![channel.clone()],
     };
     if extra_keys.is_empty() {
-        return channel.clone();
+        return vec![channel.clone()];
     }
     // Build weighted pool: primary key (weight = channel.weight) + extras.
     let mut pool: Vec<(String, i64)> = Vec::new();
@@ -98,15 +97,71 @@ async fn select_channel_key(channel: &Channel, repo: &Arc<Repository>) -> Channe
         pool.push((k.api_key.clone(), k.weight.max(1)));
     }
     if pool.is_empty() {
-        return channel.clone();
+        return vec![channel.clone()];
     }
-    // FIX-10：加权选择收敛为 core::weighted_key 单一实现（等权多 Key 均匀
-    // 分布；旧内联实现 `pick <= 0` 边界错误使第二个 Key 永远轮空，#34 根因）。
-    let chosen = crate::core::weighted_key::pick_weighted_key(&pool)
-        .unwrap_or_else(|| channel.api_key.clone());
-    let mut ch = channel.clone();
-    ch.api_key = chosen;
-    ch
+    // Duplicate values are one credential slot, not two chances to send the
+    // same secret. Preserve the first configured weight for deterministic
+    // de-duplication without ever exposing the value outside this function.
+    let mut unique = Vec::new();
+    for item in pool {
+        if !unique.iter().any(|(key, _): &(String, i64)| key == &item.0) {
+            unique.push(item);
+        }
+    }
+    let mut slots = Vec::with_capacity(unique.len());
+    while !unique.is_empty() {
+        let chosen = crate::core::weighted_key::pick_weighted_key(&unique)
+            .unwrap_or_else(|| unique[0].0.clone());
+        if let Some(index) = unique.iter().position(|(key, _)| key == &chosen) {
+            unique.remove(index);
+        } else {
+            break;
+        }
+        let mut slot = channel.clone();
+        slot.api_key = chosen;
+        slots.push(slot);
+    }
+    slots
+}
+
+/// Try every frozen credential slot only while the failure is retryable.
+/// This makes capacity envelopes useful for a channel with multiple keys while
+/// retaining the route planner's terminal/auth boundaries.
+async fn dispatch_channel_with_key_failover(
+    endpoint: EndpointKind,
+    attempt: &crate::core::attempt::PreparedAttempt,
+    channel: &Channel,
+    identity: &crate::core::channel_identity::ChannelIdentity,
+    safe_headers: &[(String, String)],
+    query: Option<&str>,
+    repo: &Arc<Repository>,
+) -> crate::core::attempt::AttemptResult {
+    let slots = channel_key_slots(channel, repo).await;
+    let mut last = None;
+    // Keep credential expansion bounded by the same conservative default as
+    // RoutePlan's per-group budget. The planner still owns cross-candidate and
+    // total-attempt limits; this cap prevents a channel with dozens of keys
+    // from bypassing those limits in one closure invocation.
+    for slot in slots.into_iter().take(3) {
+        let result =
+            dispatch_executor(endpoint, attempt, &slot, identity, safe_headers, query).await;
+        match result {
+            crate::core::attempt::AttemptResult::Failure(ref failure)
+                if failure.failure_class == FailureClass::Retryable =>
+            {
+                last = Some(result)
+            }
+            _ => return result,
+        }
+    }
+    last.unwrap_or_else(|| {
+        crate::core::attempt::AttemptResult::Failure(AttemptFailure {
+            failure_class: FailureClass::Retryable,
+            message: "no enabled channel credential slot".to_string(),
+            status_code: Some(502),
+            retry_after: None,
+        })
+    })
 }
 
 fn candidate_lookup(plan: &RoutePlan) -> HashMap<String, RouteCandidate> {
@@ -293,16 +348,14 @@ pub(crate) async fn route_plan_response_with_auth_service(
             async move {
                 match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
-                        // Multi-key load balancing: if the channel has extra
-                        // API keys, randomly select one weighted by priority.
-                        let channel = select_channel_key(&channel, &mode_health_repo).await;
-                        let result = dispatch_executor(
+                        let result = dispatch_channel_with_key_failover(
                             endpoint,
                             &attempt,
                             &channel,
                             &identity,
                             &safe,
                             query.as_deref(),
+                            &mode_health_repo,
                         )
                         .await;
                         record_channel_mode_outcome(
@@ -795,7 +848,11 @@ pub(crate) async fn route_stream_plan_with_auth_service(
 
                 let dispatched = match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
-                        let channel = select_channel_key(&channel, repo).await;
+                        let channel = channel_key_slots(&channel, repo)
+                            .await
+                            .into_iter()
+                            .next()
+                            .unwrap_or(channel);
                         dispatch_stream_executor(
                             endpoint,
                             &attempt,
@@ -911,33 +968,22 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                                 continue;
                             }
                         };
-                        if attempt.upstream_protocol == "anthropic" {
-                            if let Some(message) =
-                                crate::endpoint_executor::anthropic_stream_error_message(
-                                    &first_frame,
+                        if let Some(failure) = crate::endpoint_executor::semantic_stream_failure(
+                            &attempt.upstream_protocol,
+                            &first_frame,
+                        ) {
+                            if let Some(channel_id) = health_channel_id.as_deref() {
+                                record_channel_mode_outcome(
+                                    repo,
+                                    channel_id,
+                                    endpoint.as_str(),
+                                    true,
+                                    &crate::core::attempt::AttemptResult::Failure(failure.clone()),
                                 )
-                            {
-                                let failure = AttemptFailure {
-                                    failure_class: FailureClass::Retryable,
-                                    message: format!("Anthropic upstream stream error: {message}"),
-                                    status_code: Some(502),
-                                    retry_after: None,
-                                };
-                                if let Some(channel_id) = health_channel_id.as_deref() {
-                                    record_channel_mode_outcome(
-                                        repo,
-                                        channel_id,
-                                        endpoint.as_str(),
-                                        true,
-                                        &crate::core::attempt::AttemptResult::Failure(
-                                            failure.clone(),
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                flow.record_failure(&failure);
-                                continue;
+                                .await;
                             }
+                            flow.record_failure(&failure);
+                            continue;
                         }
 
                         let mut supervisor =

@@ -2216,6 +2216,61 @@ pub async fn handle_messages(
                 .await
             {
                 Ok((response, upstream_model)) if response.status().is_success() => {
+                    if !stream {
+                        let status = response.status();
+                        let headers = valuable_anthropic_response_headers(response.headers());
+                        let bytes = response.bytes().await.unwrap_or_default();
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(failure) =
+                                crate::endpoint_executor::semantic_failure("anthropic", &value)
+                            {
+                                last_error = format!("{}: {}", channel.name, failure.message);
+                                last_native_error = Some(StoredNativeError {
+                                    status: StatusCode::BAD_GATEWAY,
+                                    content_type: Some(axum::http::HeaderValue::from_static("application/json")),
+                                    headers,
+                                    body: bytes::Bytes::from(serde_json::to_vec(&serde_json::json!({"type":"error","error":{"type":"api_error","message":failure.message}})).unwrap_or_default()),
+                                });
+                                continue;
+                            }
+                            let usage = native_usage(&bytes, false);
+                            let mut merged_security = security_result.clone();
+                            security::scan_response_into(
+                                &mut merged_security,
+                                &value,
+                                &audited.security_settings,
+                                &[],
+                            );
+                            record_anthropic_success(
+                                repo.clone(),
+                                &key,
+                                &channel,
+                                &model,
+                                upstream_model.clone(),
+                                &sanitized_log_json,
+                                &merged_security,
+                                false,
+                                usage,
+                            )
+                            .await;
+                            let mut builder = Response::builder().status(status);
+                            for (name, value) in headers {
+                                builder = builder.header(name, value);
+                            }
+                            return builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                                anthropic_error(
+                                    StatusCode::BAD_GATEWAY,
+                                    "api_error",
+                                    "Unable to proxy native Anthropic response",
+                                )
+                            });
+                        }
+                        return anthropic_error(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            "Invalid JSON from native Anthropic channel",
+                        );
+                    }
                     return native_response(
                         response,
                         Some(StreamLogContext {
@@ -2229,7 +2284,7 @@ pub async fn handle_messages(
                             security_settings: audited.security_settings.clone(),
                             is_stream: stream,
                         }),
-                    )
+                    );
                 }
                 Ok((response, upstream_model)) => {
                     let status = StatusCode::from_u16(response.status().as_u16())
