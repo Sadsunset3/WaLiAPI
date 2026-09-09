@@ -126,7 +126,10 @@ fn build_router(state: Arc<AppState>, shared: SharedState) -> Router {
         )
         // Health check
         .route("/health", get(handle_health))
-        .layer(cors);
+        .layer(cors)
+        // 请求关联键：X-Request-Id 标准化（最外层，早于 CORS 之后的所有处理）——
+        // 统一解析（X-Request-Id > Wali-Trace-Id > 生成 UUIDv4）、回写请求头、响应头回显。
+        .layer(middleware::from_fn(super::request_id::middleware));
 
     let gateway_router = data_plane_router.merge(kb_wiki_router).merge(mcp_router);
 
@@ -324,6 +327,173 @@ mod tests {
         // 数据面 /health 不受服务 token 影响
         let res = app.oneshot(request("GET", "/health", None)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_id_generated_and_echoed_when_absent() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let res = app.oneshot(request("GET", "/health", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let echoed = res
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("缺省时应生成并回显 X-Request-Id");
+        assert!(
+            uuid::Uuid::parse_str(echoed).is_ok(),
+            "生成的关联键应为 UUIDv4：{echoed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_client_value_is_echoed_verbatim() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("x-request-id", "client-req-42")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("client-req-42"),
+            "客户端携带合法 X-Request-Id 时应原值回显"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_invalid_value_replaced_with_generated() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let oversize = "x".repeat(200);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("x-request-id", oversize.clone())
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let echoed = res
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("非法值也应回显（替换后的生成值）");
+        assert_ne!(echoed, oversize);
+        assert!(uuid::Uuid::parse_str(echoed).is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_id_wali_trace_id_still_honored() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("wali-trace-id", "legacy-trace-7")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("legacy-trace-7"),
+            "仅带旧头 Wali-Trace-Id 时应兼容采纳并以 X-Request-Id 回显"
+        );
+    }
+
+    /// 验收核心断言（HTTP 层端到端）：客户端携带 X-Request-Id 的值 ==
+    /// 响应头回显值 == 落库 chat 日志行的 trace_id。本地 axum mock 充当
+    /// 上游渠道，请求经真实 router → 中间件 → handler → proxy → mock 全链。
+    #[tokio::test]
+    async fn request_id_echoed_header_equals_persisted_trace_id() {
+        // 本地 mock 上游：合法 chat completion 响应
+        let mock_app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, key, created_at, updated_at) \
+             VALUES ('rid-key', 'rid-test', 'sk-rid-1', '2026-09-09T00:00:00+00:00', '2026-09-09T00:00:00+00:00')",
+        )
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, \
+             weight, config, model_mapping, timeout_secs, protocol, provider, native_base_url, \
+             native_endpoints, preset_revision, identity_revision, created_at, updated_at) \
+             VALUES ('rid-ch', 'rid-ch', 'openai', ?, 'sk-up', '[\"m\"]', 1, 1, 1, '{}', '{}', 60, \
+             'openai', 'openai', ?, '[\"chat_completions\"]', '2026-08-04', 1, \
+             '2026-09-09T00:00:00+00:00', '2026-09-09T00:00:00+00:00')",
+        )
+        .bind(format!("http://{addr}"))
+        .bind(format!("http://{addr}"))
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state.clone(), shared);
+
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-rid-1")
+            .header("x-request-id", "req-e2e-42")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-e2e-42"),
+            "响应头应原值回显"
+        );
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT trace_id FROM request_logs WHERE mode = 'chat' AND status_code = 200 ORDER BY seq DESC LIMIT 1")
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("req-e2e-42"),
+            "落库 trace_id 必须与响应头回显值一致（关联键闭环）"
+        );
     }
 
     #[tokio::test]

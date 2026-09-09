@@ -120,6 +120,12 @@ pub async fn run(cfg: WebServerConfig) -> Result<(), String> {
         state.settings.clone(),
     ));
 
+    // OTLP 导出（默认关闭，开启后按 seq 游标增量导出 request_log）
+    tauri::async_runtime::spawn(crate::otlp_exporter::run_export_loop(
+        state.db.pool.clone(),
+        state.settings.clone(),
+    ));
+
     tauri::async_runtime::spawn(crate::auth_provider::maintenance::run_maintenance_loop(
         auth_service,
     ));

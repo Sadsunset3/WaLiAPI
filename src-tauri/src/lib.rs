@@ -8,6 +8,7 @@ pub mod commands;
 pub mod core;
 pub mod db;
 mod endpoint_executor;
+mod otlp_exporter;
 mod protocol;
 #[cfg(test)]
 mod rollout_integration_tests;
@@ -238,6 +239,12 @@ pub fn run() {
 
                 crate::audit_log::apply_settings(&state.settings);
                 tauri::async_runtime::spawn(crate::audit_log::run_maintenance_loop(
+                    state.db.pool.clone(),
+                    state.settings.clone(),
+                ));
+
+                // OTLP 导出（默认关闭，开启后按 seq 游标增量导出 request_log）
+                tauri::async_runtime::spawn(crate::otlp_exporter::run_export_loop(
                     state.db.pool.clone(),
                     state.settings.clone(),
                 ));

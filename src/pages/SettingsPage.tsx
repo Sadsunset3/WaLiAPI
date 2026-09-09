@@ -610,6 +610,67 @@ export function SettingsPage() {
             </div>
           </div>
           <div>
+            <h3 className="mb-3 text-sm font-medium text-muted-foreground">OTLP 导出</h3>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <label className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">
+                <div>
+                  <div className="text-sm font-medium">启用 OTLP 导出</div>
+                  <p className="text-xs text-muted-foreground">把请求日志增量导出为 OTLP span（Langfuse 等 OTLP 兼容端可直接接入）；默认关闭，关闭时零后台流量。</p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.otlp_enabled}
+                  onChange={e => setSettings({ ...settings, otlp_enabled: e.target.checked })}
+                  className="h-5 w-5"
+                />
+              </label>
+              <div>
+                <label className="mb-2 block text-sm font-medium">OTLP/HTTP 端点</label>
+                <input
+                  type="text"
+                  value={settings.otlp_endpoint}
+                  onChange={e => setSettings({ ...settings, otlp_endpoint: e.target.value })}
+                  placeholder="https://langfuse.example.com/api/public/otel/v1/traces"
+                  className={inputCls}
+                />
+                <p className="mt-1 text-xs text-muted-foreground">OTLP/HTTP JSON 端点地址；导出失败自动退避重试，不影响请求主链路。</p>
+              </div>
+              <div>
+                <label className="mb-2 block text-sm font-medium">附加请求头（JSON）</label>
+                <input
+                  type="text"
+                  value={settings.otlp_headers}
+                  onChange={e => setSettings({ ...settings, otlp_headers: e.target.value })}
+                  placeholder='{"Authorization": "Basic …"}'
+                  className={inputCls}
+                />
+                <p className="mt-1 text-xs text-muted-foreground">JSON 对象字符串，鉴权头仅保存在本地设置存储中。</p>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="mb-2 block text-sm font-medium">导出间隔（秒）</label>
+                  <input
+                    type="number"
+                    min={5}
+                    value={settings.otlp_interval_secs}
+                    onChange={e => setSettings({ ...settings, otlp_interval_secs: Number(e.target.value) })}
+                    className={inputCls}
+                  />
+                </div>
+                <div>
+                  <label className="mb-2 block text-sm font-medium">每批条数</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.otlp_batch_size}
+                    onChange={e => setSettings({ ...settings, otlp_batch_size: Number(e.target.value) })}
+                    className={inputCls}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+          <div>
             <h3 className="mb-3 text-sm font-medium text-muted-foreground">路由设置</h3>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
               <label className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">

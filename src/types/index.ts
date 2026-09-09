@@ -434,6 +434,12 @@ export interface Settings {
   ocr_dpi: number;
   log_detail_level: "basic" | "detailed" | string;
   log_retention_days: number;
+  // OTLP 导出（request_log → OTLP/HTTP JSON span，默认关闭）
+  otlp_enabled: boolean;
+  otlp_endpoint: string;
+  otlp_headers: string;
+  otlp_interval_secs: number;
+  otlp_batch_size: number;
 }
 
 // Security rule types
