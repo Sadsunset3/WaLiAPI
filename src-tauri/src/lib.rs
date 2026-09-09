@@ -306,6 +306,7 @@ pub fn run() {
             commands::log::count_logs,
             commands::log::get_log,
             commands::log::get_log_security_findings,
+            commands::log::get_log_stream_segments,
             commands::log::delete_log,
             commands::log::delete_logs_before,
             commands::log::delete_all_logs,

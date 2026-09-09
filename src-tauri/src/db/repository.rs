@@ -1,5 +1,5 @@
 use super::models::*;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 /// Parse the stored JSON endpoint list back into a Vec, or None when empty/absent.
 fn parse_eps(raw: &Option<String>) -> Option<Vec<String>> {
@@ -1256,7 +1256,44 @@ impl Repository {
         })
         .execute(&self.pool)
         .await?;
+        // 流式内容段（迁移 032）：detailed 策略下把流式累计内容同步落入溢出表，
+        // 日志详情与后续续传能力按 log_id 寻址；basic 尊重用户存储选择不落段。
+        // best-effort：段写入失败仅告警，不使主日志落账失败（主表行是权威记录）。
+        if log.is_stream == 1 && policy.detail_level == crate::audit_log::LogDetailLevel::Detailed {
+            if let Some(content) = log.response_choices.as_deref() {
+                if !content.is_empty() {
+                    if let Err(error) = sqlx::query(
+                        "INSERT INTO stream_segments (log_id, seq, content, created_at) VALUES (?, 1, ?, ?)",
+                    )
+                    .bind(&log.id)
+                    .bind(content)
+                    .bind(&log.created_at)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        tracing::warn!("[流式段] 写入失败（不影响主日志）: {error}");
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// 读取某次流式请求的全部已生成内容段（按 seq 升序拼接即完整内容）。
+    pub async fn get_stream_segments(
+        &self,
+        log_id: &str,
+    ) -> Result<Vec<(i64, String)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT seq, content FROM stream_segments WHERE log_id = ? ORDER BY seq ASC",
+        )
+        .bind(log_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<i64, _>("seq"), row.get::<String, _>("content")))
+            .collect())
     }
 
     pub async fn create_security_findings(
@@ -1313,6 +1350,10 @@ impl Repository {
             .bind(before_date)
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM stream_segments WHERE log_id IN (SELECT id FROM request_logs WHERE created_at < ?)")
+            .bind(before_date)
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE created_at < ?")
             .bind(before_date)
             .execute(&self.pool)
@@ -1324,6 +1365,9 @@ impl Repository {
         sqlx::query("DELETE FROM request_security_findings")
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM stream_segments")
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&self.pool)
             .await?;
@@ -1332,6 +1376,10 @@ impl Repository {
 
     pub async fn delete_log(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM request_security_findings WHERE log_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM stream_segments WHERE log_id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;

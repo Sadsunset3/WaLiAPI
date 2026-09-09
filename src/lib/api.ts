@@ -102,6 +102,8 @@ export const logApi = {
   count: (input?: GetLogsInput) => invoke<number>("count_logs", { input: input || {} }),
   get: (id: string) => invoke<RequestLog>("get_log", { id }),
   getSecurityFindings: (logId: string) => invoke<SecurityFinding[]>("get_log_security_findings", { logId }),
+  /** 流式请求的已生成内容段（detailed 策略下落库；按 seq 升序拼接即完整内容）。 */
+  getStreamSegments: (logId: string) => invoke<Array<{ seq: number; content: string }>>("get_log_stream_segments", { logId }),
   getStats: (days?: number) => invoke<LogStats[]>("get_log_stats", { days }),
   delete: (id: string) => invoke<void>("delete_log", { id }),
   deleteBefore: (beforeDate: string) => invoke<number>("delete_logs_before", { beforeDate }),

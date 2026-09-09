@@ -318,6 +318,36 @@ pub async fn get_log_security_findings_impl(
         .map(|fs| fs.into_iter().map(Into::into).collect())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamSegmentDto {
+    pub seq: i64,
+    pub content: String,
+}
+
+#[tauri::command]
+pub async fn get_log_stream_segments(
+    log_id: String,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<Vec<StreamSegmentDto>, String> {
+    get_log_stream_segments_impl(&log_id, &*state).await
+}
+
+pub async fn get_log_stream_segments_impl(
+    log_id: &str,
+    state: &std::sync::Arc<AppState>,
+) -> Result<Vec<StreamSegmentDto>, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.get_stream_segments(log_id)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|(seq, content)| StreamSegmentDto { seq, content })
+                .collect()
+        })
+}
+
 #[tauri::command]
 pub async fn delete_log(
     id: String,
