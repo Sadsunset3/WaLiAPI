@@ -10,6 +10,7 @@ pub mod db;
 mod endpoint_executor;
 mod otlp_exporter;
 pub mod health_probe;
+pub mod prompt_templates;
 mod protocol;
 #[cfg(test)]
 mod rollout_integration_tests;
@@ -238,6 +239,10 @@ pub fn run() {
                 });
                 app_handle.manage(state.clone());
 
+                // Prompt 模板种子（C-07）：空表时写入源码字面量 v1——升级后行为逐字节不变
+                if let Err(error) = crate::prompt_templates::seed_if_empty(&state.db.pool).await {
+                    tracing::warn!("[模板] 种子写入失败（运行时回退编译期默认）: {error}");
+                }
                 crate::audit_log::apply_settings(&state.settings);
                 tauri::async_runtime::spawn(crate::audit_log::run_maintenance_loop(
                     state.db.pool.clone(),
@@ -325,6 +330,9 @@ pub fn run() {
             commands::log::delete_logs_before,
             commands::log::delete_all_logs,
             commands::log::get_log_stats,
+            commands::prompt_template::list_prompt_templates,
+            commands::prompt_template::create_prompt_template,
+            commands::prompt_template::activate_prompt_template,
             commands::log_repair::repair_stream_cancel_logs,
             commands::stats::get_dashboard_stats,
             commands::stats::get_model_stats,
