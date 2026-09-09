@@ -510,7 +510,13 @@ pub async fn handle_chat_completions(
     };
 
     if key_record.quota_limit > 0 && key_record.quota_used >= key_record.quota_limit {
-        return (StatusCode::TOO_MANY_REQUESTS, "Quota exceeded").into_response();
+        // 配额拒绝是 Key 维度终态：429 + OpenAI JSON 错误体（与其他端点一致），
+        // 不做渠道 failover（C-01）。
+        return openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            quota_exceeded_message(key_record.quota_used, key_record.quota_limit),
+            "rate_limit_error",
+        );
     }
 
     // Extract Wali-Trace-Id from request headers
@@ -1193,6 +1199,12 @@ fn anthropic_error(status: StatusCode, kind: &str, message: impl Into<String>) -
         Json(serde_json::json!({"type":"error", "error":{"type":kind, "message":message.into()}})),
     )
         .into_response()
+}
+
+/// 配额用尽文案：携带 used/limit 数值，客户端与管理端可直接从错误体读取
+/// 差额，无需另查管理面（C-01）。五端点与规划期错误共用同一模板。
+fn quota_exceeded_message(used: i64, limit: i64) -> String {
+    format!("Quota exceeded (used {} / limit {})", used, limit)
 }
 
 /// Resolve a model name through the mapping: supports both single string and
@@ -2086,7 +2098,7 @@ pub async fn handle_messages(
         return anthropic_error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
-            "Quota exceeded",
+            quota_exceeded_message(key.quota_used, key.quota_limit),
         );
     }
     let model = match json
@@ -2807,7 +2819,7 @@ pub async fn handle_responses(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
-                "error": {"message": "Quota exceeded", "type": "rate_limit_error"}
+                "error": {"message": quota_exceeded_message(key_record.quota_used, key_record.quota_limit), "type": "rate_limit_error"}
             })),
         )
             .into_response();
@@ -3487,7 +3499,7 @@ pub async fn handle_embeddings(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
-                "error": {"message": "Quota exceeded", "type": "rate_limit_error"}
+                "error": {"message": quota_exceeded_message(key_record.quota_used, key_record.quota_limit), "type": "rate_limit_error"}
             })),
         )
             .into_response();
@@ -4086,7 +4098,7 @@ async fn list_models_impl(pool: SqlitePool, headers: &HeaderMap) -> Response {
             anthropic,
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
-            "Quota exceeded",
+            quota_exceeded_message(key.quota_used, key.quota_limit),
         );
     }
     let channels = match repo.get_enabled_channels().await {
@@ -4896,6 +4908,34 @@ mod list_models_tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "rate_limit_error");
         assert_eq!(json["error"]["code"], "429");
+        // C-01：错误体携带 used/limit 数值，客户端可直接读取差额。
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Quota exceeded"), "message: {}", msg);
+        assert!(msg.contains("used "), "message: {}", msg);
+        assert!(msg.contains("limit 1000"), "message: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn quota_exceeded_returns_429_anthropic_shape() {
+        let (pool, api_key) = seed_test_db().await;
+        Repository::new(pool.clone())
+            .increment_quota(&api_key.id, 2000)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", api_key.key.parse().unwrap());
+        let resp = list_models_impl(pool, &headers).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Anthropic 形态：{"type":"error","error":{...}}，message 同样携带数值。
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Quota exceeded"), "message: {}", msg);
+        assert!(msg.contains("limit 1000"), "message: {}", msg);
     }
 
     /// Insert an auth account directly via SQL (mirrors migration 019/021

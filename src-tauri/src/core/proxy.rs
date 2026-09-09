@@ -381,12 +381,12 @@ pub async fn handle_request(
                     eprintln!("[WARN] create_security_findings failed: {}", e);
                 }
 
-                if let Some(ref u) = usage {
-                    if let Err(e) = repo
-                        .increment_quota(api_key_id, u.total_tokens as i64)
-                        .await
-                    {
-                        eprintln!("[WARN] increment_quota failed: {}", e);
+                // 两轨口径统一（C-01）：上游未回 usage 时沿用与日志同源的本地
+                // 估算计入配额（total_tokens 已在上方做过 2xx+缺失 usage 的估算
+                // 兜底），与 endpoint_executor 轨一致；估算也为 0 时不累加。
+                if total_tokens > 0 {
+                    if let Err(e) = repo.increment_quota(api_key_id, total_tokens).await {
+                        tracing::warn!("increment_quota failed: {}", e);
                     }
                 }
 

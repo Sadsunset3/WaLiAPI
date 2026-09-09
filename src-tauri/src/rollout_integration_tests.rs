@@ -2130,8 +2130,97 @@ async fn security_quota_exceeded_zero_upstream() {
     )
     .await
     .expect_err("quota");
-    assert_eq!(err, crate::core::route_plan::PlanError::QuotaExceeded);
+    assert_eq!(
+        err,
+        crate::core::route_plan::PlanError::QuotaExceeded(100, 100)
+    );
     assert_eq!(mock.call_count().await, 0);
+}
+
+/// C-01：递增封顶——quota_limit > 0 时 quota_used 不越界；0 视为不限纯加法。
+#[tokio::test]
+async fn quota_increment_caps_at_positive_limit() {
+    let pool = fresh_db().await;
+    let mut capped = api_key();
+    capped.id = "key-capped".into();
+    capped.quota_limit = 1000;
+    insert_api_key(&pool, &capped).await;
+    let mut unlimited = api_key();
+    unlimited.id = "key-unlimited".into();
+    unlimited.key = "sk-test-unlimited".into();
+    unlimited.quota_limit = 0;
+    insert_api_key(&pool, &unlimited).await;
+
+    let repo = Repository::new(pool.clone());
+    repo.increment_quota(&capped.id, 600).await.unwrap();
+    repo.increment_quota(&capped.id, 600).await.unwrap();
+    assert_eq!(
+        repo.get_api_key_by_id(&capped.id).await.unwrap().quota_used,
+        1000,
+        "capped at limit"
+    );
+
+    repo.increment_quota(&unlimited.id, 500).await.unwrap();
+    repo.increment_quota(&unlimited.id, 500).await.unwrap();
+    assert_eq!(
+        repo.get_api_key_by_id(&unlimited.id)
+            .await
+            .unwrap()
+            .quota_used,
+        1000,
+        "limit 0 means unlimited: plain sum"
+    );
+}
+
+/// C-01：legacy 轨上游 2xx 但不回 usage 时，配额按本地估算累加，
+/// 与 endpoint_executor 轨口径一致。
+#[tokio::test]
+async fn legacy_proxy_estimates_quota_when_upstream_omits_usage() {
+    let mock = MockUpstream::start_fixed(
+        br#"{"choices":[{"message":{"role":"assistant","content":"hello there friend"}}]}"#
+            .to_vec(),
+        200,
+    )
+    .await;
+    let pool = fresh_db().await;
+    let key = api_key();
+    insert_api_key(&pool, &key).await;
+    let ch = channel(
+        "n1",
+        "openai",
+        "openai",
+        &format!("http://{}", mock.addr),
+        &["chat_completions"],
+        &["m"],
+        1,
+        "{}",
+    );
+    insert_channel(&pool, &ch).await;
+
+    let settings = crate::settings_store::SettingsStore::file(
+        std::env::temp_dir().join(format!(
+            "waliapi-proxy-quota-test-{}.json",
+            uuid::Uuid::new_v4()
+        )),
+    );
+    let repo = Arc::new(Repository::new(pool.clone()));
+    let result = crate::core::proxy::handle_request(
+        &repo,
+        &settings,
+        &key.id,
+        "tester",
+        json!({"model":"m","messages":[{"role":"user","content":"hello world how are you today"}]}),
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("proxy request");
+    assert_eq!(result.status, 200);
+
+    let used = repo.get_api_key_by_id(&key.id).await.unwrap().quota_used;
+    assert!(used > 0, "estimated usage must be recorded, got {}", used);
 }
 
 /// Model not allowed → PlanError::ModelNotAllowed; zero upstream.

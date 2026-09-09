@@ -831,11 +831,18 @@ impl Repository {
     }
 
     pub async fn increment_quota(&self, id: &str, tokens: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE api_keys SET quota_used = quota_used + ? WHERE id = ?")
-            .bind(tokens)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        // 配额递增带封顶（C-01）：quota_limit > 0 时 quota_used 不越过上限；
+        // -1/0 表示不限，纯加法。检查发生在请求前、递增在响应后，并发窗口内
+        // 多个在途请求可同时放行——封顶保证越界幅度有界，属已知可接受行为。
+        sqlx::query(
+            "UPDATE api_keys SET quota_used = CASE WHEN quota_limit > 0 \
+             THEN MIN(quota_used + ?, quota_limit) ELSE quota_used + ? END WHERE id = ?",
+        )
+        .bind(tokens)
+        .bind(tokens)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
