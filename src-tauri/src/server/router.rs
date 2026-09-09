@@ -415,6 +415,87 @@ mod tests {
         );
     }
 
+    /// 验收核心断言（HTTP 层端到端）：客户端携带 X-Request-Id 的值 ==
+    /// 响应头回显值 == 落库 chat 日志行的 trace_id。本地 axum mock 充当
+    /// 上游渠道，请求经真实 router → 中间件 → handler → proxy → mock 全链。
+    #[tokio::test]
+    async fn request_id_echoed_header_equals_persisted_trace_id() {
+        // 本地 mock 上游：合法 chat completion 响应
+        let mock_app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, key, created_at, updated_at) \
+             VALUES ('rid-key', 'rid-test', 'sk-rid-1', '2026-09-09T00:00:00+00:00', '2026-09-09T00:00:00+00:00')",
+        )
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, \
+             weight, config, model_mapping, timeout_secs, protocol, provider, native_base_url, \
+             native_endpoints, preset_revision, identity_revision, created_at, updated_at) \
+             VALUES ('rid-ch', 'rid-ch', 'openai', ?, 'sk-up', '[\"m\"]', 1, 1, 1, '{}', '{}', 60, \
+             'openai', 'openai', ?, '[\"chat_completions\"]', '2026-08-04', 1, \
+             '2026-09-09T00:00:00+00:00', '2026-09-09T00:00:00+00:00')",
+        )
+        .bind(format!("http://{addr}"))
+        .bind(format!("http://{addr}"))
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state.clone(), shared);
+
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-rid-1")
+            .header("x-request-id", "req-e2e-42")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-e2e-42"),
+            "响应头应原值回显"
+        );
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT trace_id FROM request_logs WHERE mode = 'chat' AND status_code = 200 ORDER BY seq DESC LIMIT 1")
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("req-e2e-42"),
+            "落库 trace_id 必须与响应头回显值一致（关联键闭环）"
+        );
+    }
+
     #[tokio::test]
     async fn cors_only_covers_data_plane_not_service_routes() {
         let state = test_state().await;
