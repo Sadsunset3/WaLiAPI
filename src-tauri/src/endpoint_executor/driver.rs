@@ -2624,6 +2624,66 @@ mod tests {
         );
     }
 
+    /// 第一档端到端（真实路径）：chat SSE 流（带终止帧、有累计内容）完整走完
+    /// stream_response_body → 落账行 → create_log 漏斗 → 段表出现内容段。
+    /// 此前段测试直接构造 log 调漏斗，未覆盖 driver 真实累计内容到段的链路。
+    #[tokio::test]
+    async fn chat_stream_accumulated_content_reaches_segments() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = hanging_after_terminal_upstream(true, true);
+        let pump = pump_for(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+
+        // 落账行存在且为流式
+        let row = repo
+            .get_logs(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("完成流应落账");
+        assert_eq!(row.is_stream, 1);
+
+        // 段表出现该 log_id 的内容段（detailed 默认策略 + 流式 + 有累计内容）
+        let segments = repo.get_stream_segments(&row.id).await.unwrap();
+        assert!(
+            !segments.is_empty(),
+            "chat SSE 累计内容应经漏斗落段（log {}）",
+            row.id
+        );
+        let joined: String = segments.into_iter().map(|(_, c)| c).collect();
+        assert!(
+            joined.contains("hi"),
+            "段内容应来自真实累计（含上游 delta 文本），实际: {joined}"
+        );
+    }
+
     #[test]
     fn extract_response_id_parses_created_event_only() {
         let created =
