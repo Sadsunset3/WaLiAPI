@@ -72,6 +72,11 @@ pub struct Settings {
     pub otlp_interval_secs: u64,
     #[serde(default = "default_otlp_batch_size")]
     pub otlp_batch_size: u64,
+    /// 渠道主动健康探测开关（默认开）。关闭时零后台流量。
+    #[serde(default = "default_true")]
+    pub probe_enabled: bool,
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
 }
 
 fn default_otlp_interval_secs() -> u64 {
@@ -79,6 +84,9 @@ fn default_otlp_interval_secs() -> u64 {
 }
 fn default_otlp_batch_size() -> u64 {
     50
+}
+fn default_probe_interval_secs() -> u64 {
+    300
 }
 
 fn default_port() -> u16 {
@@ -160,6 +168,8 @@ impl Default for Settings {
             otlp_headers: String::new(),
             otlp_interval_secs: default_otlp_interval_secs(),
             otlp_batch_size: default_otlp_batch_size(),
+            probe_enabled: default_true(),
+            probe_interval_secs: default_probe_interval_secs(),
         }
     }
 }
@@ -248,6 +258,8 @@ pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Sett
         otlp_headers: get_str(store, "otlp.headers", ""),
         otlp_interval_secs: get_u64(store, "otlp.export_interval_secs", 30),
         otlp_batch_size: get_u64(store, "otlp.batch_size", 50),
+        probe_enabled: get_bool(store, "probe.enabled", true),
+        probe_interval_secs: get_u64(store, "probe.interval_secs", 300),
     };
     Ok(settings)
 }
@@ -379,6 +391,14 @@ pub async fn save_settings(
         (
             "otlp.batch_size".to_string(),
             serde_json::json!(settings.otlp_batch_size),
+        ),
+        (
+            "probe.enabled".to_string(),
+            serde_json::json!(settings.probe_enabled),
+        ),
+        (
+            "probe.interval_secs".to_string(),
+            serde_json::json!(settings.probe_interval_secs),
         ),
     ])?;
     crate::audit_log::apply_settings(&state.settings);

@@ -43,6 +43,10 @@ export interface Channel {
   updated_at: string;
   last_test_at: string | null;
   last_test_ok: number | null;
+  /** 主动健康探测（迁移 033）：探测列优先展示，无探测数据回退手动测试列。 */
+  last_probe_at: string | null;
+  last_probe_ok: number | null;
+  probe_latency_ms: number | null;
   /** Multi-key: extra API keys (masked in DTO, use getChannelExtraKeys for full). */
   extra_keys: ChannelKey[];
 }
@@ -440,6 +444,9 @@ export interface Settings {
   otlp_headers: string;
   otlp_interval_secs: number;
   otlp_batch_size: number;
+  // 渠道主动健康探测
+  probe_enabled: boolean;
+  probe_interval_secs: number;
 }
 
 // Security rule types

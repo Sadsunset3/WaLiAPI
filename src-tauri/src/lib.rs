@@ -9,6 +9,7 @@ pub mod core;
 pub mod db;
 mod endpoint_executor;
 mod otlp_exporter;
+pub mod health_probe;
 mod protocol;
 #[cfg(test)]
 mod rollout_integration_tests;
@@ -245,6 +246,12 @@ pub fn run() {
 
                 // OTLP 导出（默认关闭，开启后按 seq 游标增量导出 request_log）
                 tauri::async_runtime::spawn(crate::otlp_exporter::run_export_loop(
+                    state.db.pool.clone(),
+                    state.settings.clone(),
+                ));
+
+                // 渠道主动健康探测（默认开启 300s 一轮，可整体关闭）
+                tauri::async_runtime::spawn(crate::health_probe::run_probe_loop(
                     state.db.pool.clone(),
                     state.settings.clone(),
                 ));

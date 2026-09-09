@@ -52,6 +52,14 @@ pub struct Channel {
     pub updated_at: String,
     pub last_test_at: Option<String>,
     pub last_test_ok: Option<i64>,
+    /// 主动健康探测（迁移 033）：NULL = 从未探测（排序视为健康）。
+    /// default：部分集成测试只迁移到 015，行中无这些列时按「未探测」处理。
+    #[sqlx(default)]
+    pub last_probe_at: Option<String>,
+    #[sqlx(default)]
+    pub last_probe_ok: Option<i64>,
+    #[sqlx(default)]
+    pub probe_latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
