@@ -513,11 +513,10 @@ pub async fn handle_chat_completions(
         return (StatusCode::TOO_MANY_REQUESTS, "Quota exceeded").into_response();
     }
 
-    // Extract Wali-Trace-Id from request headers
-    let trace_id = headers
-        .get("Wali-Trace-Id")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+    // 请求关联键：X-Request-Id（兼容 Wali-Trace-Id，缺省生成 UUIDv4）。
+    // 中间件已统一解析并回写请求头，此处调用同一 resolve 保证取到同一值；
+    // 直调（测试/内部路径）时无中间件，resolve 自行解析兜底。
+    let trace_id = Some(crate::server::request_id::resolve(&headers));
 
     // Unified security audit gate — audits the ORIGINAL protocol JSON full
     // tree before any routing/codec.  Fail-closed (Confirm/budget) returns
@@ -1383,6 +1382,8 @@ struct StreamLogContext {
     /// FIX-16：请求准入时的安全设置快照——响应侧扫描沿用同一口径。
     security_settings: security::SecuritySettings,
     is_stream: bool,
+    /// 请求关联键（X-Request-Id），随落账行写 trace_id。
+    trace_id: Option<String>,
 }
 
 const MAX_NATIVE_SSE_RECORD_BYTES: usize = 64 * 1024;
@@ -1402,6 +1403,8 @@ struct NativeStreamFinalizer {
     /// FIX-16：与转发循环共享的响应扫描累积器——断开/中断行扫半程内容。
     scan_buffer: std::sync::Arc<std::sync::Mutex<ResponseScanBuffer>>,
     is_stream: bool,
+    /// 请求关联键（X-Request-Id），随 499/502 落账行写 trace_id。
+    trace_id: Option<String>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1421,6 +1424,7 @@ impl NativeStreamFinalizer {
             security_settings: ctx.security_settings.clone(),
             scan_buffer,
             is_stream: ctx.is_stream,
+            trace_id: ctx.trace_id.clone(),
             done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -1458,6 +1462,7 @@ impl NativeStreamFinalizer {
             502,
             Some("native upstream stream interrupted".to_string()),
             usage,
+            self.trace_id.clone(),
         )
         .await;
     }
@@ -1486,6 +1491,7 @@ impl Drop for NativeStreamFinalizer {
                 let security = self.merged_security();
                 let is_stream = self.is_stream;
                 let usage = self.estimated_usage();
+                let trace_id = self.trace_id.clone();
                 handle.spawn(async move {
                     record_anthropic_outcome(
                         repo,
@@ -1499,6 +1505,7 @@ impl Drop for NativeStreamFinalizer {
                         499,
                         Some("client_cancelled".to_string()),
                         usage,
+                        trace_id,
                     )
                     .await;
                 });
@@ -1753,7 +1760,7 @@ fn native_response(response: reqwest::Response, accounting: Option<StreamLogCont
                     non_sse_observed.clone()
                 };
                 scan_bytes_into(&mut merged_security, &scan_bytes, &context.security_settings);
-                record_anthropic_success(context.repo, &context.key, &context.channel, &context.model, context.upstream_model.clone(), &context.request, &merged_security, context.is_stream, usage).await;
+                record_anthropic_success(context.repo, &context.key, &context.channel, &context.model, context.upstream_model.clone(), &context.request, &merged_security, context.is_stream, usage, context.trace_id.clone()).await;
             } else if let Some(f) = finalizer.as_ref() {
                 // 上游中断：502 行 + 已解析的部分用量（估算兜底同取消路径）。
                 let partial = {
@@ -1923,6 +1930,7 @@ async fn record_anthropic_outcome(
     status_code: i64,
     error_message: Option<String>,
     usage: Option<(i64, i64, i64)>,
+    trace_id: Option<String>,
 ) {
     let (prompt_tokens, completion_tokens, cached_tokens) = usage.unwrap_or((0, 0, 0));
     let mut total_tokens = prompt_tokens + completion_tokens;
@@ -1976,7 +1984,7 @@ async fn record_anthropic_outcome(
         security_action: security_result.action.as_str().to_string(),
         sanitized: i64::from(log_sanitized || security_result.sanitized),
         blocked_reason: security_result.blocked_reason.clone(),
-        trace_id: None,
+        trace_id,
         // T09: native/OpenAI-compat Messages path.  downstream is the Messages
         // endpoint; the other observability fields (route_group / upstream
         // protocol/endpoint / codec / failure class) are populated by the
@@ -2016,6 +2024,7 @@ async fn record_anthropic_success(
     security_result: &security::SecurityScanResult,
     is_stream: bool,
     usage: Option<(i64, i64, i64)>,
+    trace_id: Option<String>,
 ) {
     record_anthropic_outcome(
         repo,
@@ -2029,6 +2038,7 @@ async fn record_anthropic_success(
         200,
         None,
         usage,
+        trace_id,
     )
     .await;
 }
@@ -2111,12 +2121,14 @@ pub async fn handle_messages(
     // full tree before any routing/codec.  The raw query string is audited as
     // part of the envelope so the native executor can forward it safely.
     let query = uri.query().map(|s| s.to_string());
+    // 请求关联键：X-Request-Id（兼容 Wali-Trace-Id，缺省生成 UUIDv4）。
+    let trace_id = Some(crate::server::request_id::resolve(&headers));
     let audited = match audit_original(
         security::gate::DownstreamProtocol::Messages,
         "/v1/messages",
         json.clone(),
         query.clone(),
-        None,
+        trace_id.clone(),
         &shared,
     )
     .await
@@ -2140,6 +2152,7 @@ pub async fn handle_messages(
             451,
             security_result.blocked_reason.clone(),
             None,
+            trace_id.clone(),
         )
         .await;
         return anthropic_error(
@@ -2162,7 +2175,7 @@ pub async fn handle_messages(
         "anthropic",
         &safe_headers,
         &sanitized_log_body,
-        None,
+        trace_id.clone(),
     )
     .await
     {
@@ -2227,6 +2240,7 @@ pub async fn handle_messages(
                             security: security_result.clone(),
                             security_settings: audited.security_settings.clone(),
                             is_stream: stream,
+                            trace_id: trace_id.clone(),
                         }),
                     )
                 }
@@ -2257,6 +2271,7 @@ pub async fn handle_messages(
                                 status.as_u16() as i64,
                                 Some(format!("Native upstream returned HTTP {status}")),
                                 None,
+                                trace_id.clone(),
                             )
                             .await;
                             // An upstream 401/403 is a channel-credential
@@ -2291,6 +2306,7 @@ pub async fn handle_messages(
                         502,
                         Some(last_error.clone()),
                         None,
+                        trace_id.clone(),
                     )
                     .await;
                 }
@@ -2327,6 +2343,7 @@ pub async fn handle_messages(
                         security: security_result.clone(),
                         security_settings: audited.security_settings.clone(),
                         is_stream: true,
+                        trace_id: trace_id.clone(),
                     },
                 )
             }
@@ -2372,6 +2389,7 @@ pub async fn handle_messages(
                             &merged_security,
                             false,
                             usage,
+                            trace_id.clone(),
                         )
                         .await;
                         (StatusCode::OK, Json(value)).into_response()
@@ -2399,6 +2417,7 @@ pub async fn handle_messages(
                             502,
                             Some(message),
                             None,
+                            trace_id.clone(),
                         )
                         .await;
                         upstream_attempts = upstream_attempts.saturating_sub(1);
@@ -2437,6 +2456,7 @@ pub async fn handle_messages(
                             status.as_u16() as i64,
                             Some(last_error.clone()),
                             None,
+                            trace_id.clone(),
                         )
                         .await;
                         // openai_error_response already maps an upstream
@@ -2459,6 +2479,7 @@ pub async fn handle_messages(
                     502,
                     Some(last_error.clone()),
                     None,
+                    trace_id.clone(),
                 )
                 .await;
             }
@@ -2483,6 +2504,7 @@ pub async fn handle_messages(
             400,
             Some(last_error.clone()),
             None,
+            trace_id.clone(),
         )
         .await;
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", last_error);
@@ -2499,6 +2521,7 @@ pub async fn handle_messages(
         502,
         Some(last_error.clone()),
         None,
+        trace_id.clone(),
     )
     .await;
     anthropic_error(
@@ -2535,7 +2558,7 @@ fn openai_sse_response(
                         failed = true;
                         let mut merged = accounting.security.clone();
                         scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
-                        record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None).await;
+                        record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None, accounting.trace_id.clone()).await;
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{}}}}}\n\n", serde_json::to_string(&message).unwrap()).into_bytes()));
                         break;
                     }
@@ -2546,7 +2569,7 @@ fn openai_sse_response(
                     let message = format!("OpenAI stream interrupted: {error}");
                     let mut merged = accounting.security.clone();
                     scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
-                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(message.clone()), None).await;
+                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(message.clone()), None, accounting.trace_id.clone()).await;
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{}}}}}\n\n", serde_json::to_string(&message).unwrap()).into_bytes()));
                     break;
                 }
@@ -2559,12 +2582,12 @@ fn openai_sse_response(
                     let usage = state.usage();
                     let mut merged = accounting.security.clone();
                     scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
-                    record_anthropic_success(accounting.repo, &accounting.key, &accounting.channel, &accounting.model, None, &accounting.request, &merged, true, Some(usage)).await;
+                    record_anthropic_success(accounting.repo, &accounting.key, &accounting.channel, &accounting.model, None, &accounting.request, &merged, true, Some(usage), accounting.trace_id.clone()).await;
                 },
                 Err(message) => {
                     let mut merged = accounting.security.clone();
                     scan_bytes_into(&mut merged, &scan_buffer.buf, &accounting.security_settings);
-                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None).await;
+                    record_anthropic_outcome(accounting.repo.clone(), &accounting.key, Some(&accounting.channel), &accounting.model, None, &accounting.request, &merged, true, 502, Some(format!("OpenAI stream conversion failed: {message}")), None, accounting.trace_id.clone()).await;
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{}}}}}\n\n", serde_json::to_string(&message).unwrap()).into_bytes()))
                 },
             }
@@ -2637,12 +2660,13 @@ pub async fn handle_messages_count_tokens(
     };
     // Unified security audit gate — audits the ORIGINAL Count Tokens JSON.
     let query = uri.query().map(|s| s.to_string());
+    let trace_id = Some(crate::server::request_id::resolve(&headers));
     let audited = match audit_original(
         security::gate::DownstreamProtocol::CountTokens,
         "/v1/messages/count_tokens",
         json.clone(),
         query.clone(),
-        None,
+        trace_id.clone(),
         &shared,
     )
     .await
@@ -2673,7 +2697,7 @@ pub async fn handle_messages_count_tokens(
         "anthropic_count_tokens",
         &safe_headers,
         &sanitized_log_body,
-        None,
+        trace_id.clone(),
     )
     .await
     {
@@ -2813,10 +2837,7 @@ pub async fn handle_responses(
             .into_response();
     }
 
-    let trace_id = headers
-        .get("Wali-Trace-Id")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+    let trace_id = Some(crate::server::request_id::resolve(&headers));
     // Unified security audit gate — audits the ORIGINAL Responses protocol
     // JSON full tree (built-in tools, image URLs, files, unknown blocks)
     // before any Responses→Chat conversion.
@@ -3498,10 +3519,7 @@ pub async fn handle_embeddings(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let trace_id = headers
-        .get("Wali-Trace-Id")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+    let trace_id = Some(crate::server::request_id::resolve(&headers));
     // Unified security audit gate — audits the ORIGINAL Embeddings JSON.
     let audited = match audit_original(
         security::gate::DownstreamProtocol::Embeddings,

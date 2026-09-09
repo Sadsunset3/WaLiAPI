@@ -126,7 +126,10 @@ fn build_router(state: Arc<AppState>, shared: SharedState) -> Router {
         )
         // Health check
         .route("/health", get(handle_health))
-        .layer(cors);
+        .layer(cors)
+        // 请求关联键：X-Request-Id 标准化（最外层，早于 CORS 之后的所有处理）——
+        // 统一解析（X-Request-Id > Wali-Trace-Id > 生成 UUIDv4）、回写请求头、响应头回显。
+        .layer(middleware::from_fn(super::request_id::middleware));
 
     let gateway_router = data_plane_router.merge(kb_wiki_router).merge(mcp_router);
 
@@ -324,6 +327,92 @@ mod tests {
         // 数据面 /health 不受服务 token 影响
         let res = app.oneshot(request("GET", "/health", None)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_id_generated_and_echoed_when_absent() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let res = app.oneshot(request("GET", "/health", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let echoed = res
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("缺省时应生成并回显 X-Request-Id");
+        assert!(
+            uuid::Uuid::parse_str(echoed).is_ok(),
+            "生成的关联键应为 UUIDv4：{echoed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_client_value_is_echoed_verbatim() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("x-request-id", "client-req-42")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("client-req-42"),
+            "客户端携带合法 X-Request-Id 时应原值回显"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_invalid_value_replaced_with_generated() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let oversize = "x".repeat(200);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("x-request-id", oversize.clone())
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let echoed = res
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("非法值也应回显（替换后的生成值）");
+        assert_ne!(echoed, oversize);
+        assert!(uuid::Uuid::parse_str(echoed).is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_id_wali_trace_id_still_honored() {
+        let state = test_state().await;
+        let shared = test_shared(&state, Some(ADMIN_TOKEN), Some(MCP_TOKEN));
+        let app = build_router(state, shared);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("wali-trace-id", "legacy-trace-7")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("legacy-trace-7"),
+            "仅带旧头 Wali-Trace-Id 时应兼容采纳并以 X-Request-Id 回显"
+        );
     }
 
     #[tokio::test]
