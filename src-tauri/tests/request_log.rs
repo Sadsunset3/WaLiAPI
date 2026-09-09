@@ -430,3 +430,102 @@ async fn request_log_cleanup_removes_expired_rows_and_findings() {
         0
     );
 }
+
+// ─── Stream segments（迁移 032：流式内容段溢出表）────────────────────────────
+
+fn detailed_policy() -> waliapi_lib::audit_log::LogPolicy {
+    waliapi_lib::audit_log::LogPolicy {
+        detail_level: waliapi_lib::audit_log::LogDetailLevel::Detailed,
+        retention_days: 7,
+    }
+}
+
+#[tokio::test]
+async fn stream_segments_persisted_only_under_detailed_policy_for_streams() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool);
+
+    // detailed + 流式 + 有内容 → 落段
+    let mut log = full_log(None, Some("seg-1"));
+    log.id = "stream-detailed".into();
+    log.response_choices = Some("{\"choices\":[{\"message\":{\"content\":\"部分生成内容\"}}]}".into());
+    repo.create_log_with_policy(&log, detailed_policy()).await.unwrap();
+    let segments = repo.get_stream_segments("stream-detailed").await.unwrap();
+    assert_eq!(segments.len(), 1, "detailed 流式应落一段");
+    assert_eq!(segments[0].0, 1);
+    assert!(segments[0].1.contains("部分生成内容"));
+
+    // basic + 流式 + 有内容 → 不落段（尊重用户存储选择）
+    let mut log = full_log(None, Some("seg-2"));
+    log.id = "stream-basic".into();
+    log.response_choices = Some("{\"choices\":[]}".into());
+    repo.create_log_with_policy(
+        &log,
+        waliapi_lib::audit_log::LogPolicy {
+            detail_level: waliapi_lib::audit_log::LogDetailLevel::Basic,
+            retention_days: 7,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        repo.get_stream_segments("stream-basic").await.unwrap().is_empty(),
+        "basic 不落段"
+    );
+
+    // detailed + 非流式 → 不落段
+    let mut log = full_log(None, Some("seg-3"));
+    log.id = "non-stream".into();
+    log.is_stream = 0;
+    log.response_choices = Some("{\"choices\":[]}".into());
+    repo.create_log_with_policy(&log, detailed_policy()).await.unwrap();
+    assert!(
+        repo.get_stream_segments("non-stream").await.unwrap().is_empty(),
+        "非流式不落段"
+    );
+
+    // detailed + 流式 + 内容为空 → 不落段
+    let mut log = full_log(None, Some("seg-4"));
+    log.id = "stream-empty".into();
+    log.response_choices = None;
+    repo.create_log_with_policy(&log, detailed_policy()).await.unwrap();
+    assert!(
+        repo.get_stream_segments("stream-empty").await.unwrap().is_empty(),
+        "无累计内容不落段"
+    );
+}
+
+#[tokio::test]
+async fn stream_segments_purged_by_all_delete_paths() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool);
+
+    // 一条“过期”日志与一条“新”日志，均带段
+    let mut old = full_log(None, Some("old"));
+    old.id = "old-log".into();
+    old.created_at = "2020-01-01T00:00:00+00:00".into();
+    old.response_choices = Some("old-content".into());
+    let mut new = full_log(None, Some("new"));
+    new.id = "new-log".into();
+    new.created_at = now();
+    new.response_choices = Some("new-content".into());
+    repo.create_log_with_policy(&old, detailed_policy()).await.unwrap();
+    repo.create_log_with_policy(&new, detailed_policy()).await.unwrap();
+
+    // 按日期清理：只清旧的（段随主行走）
+    repo.delete_logs_before("2021-01-01T00:00:00+00:00").await.unwrap();
+    assert!(repo.get_stream_segments("old-log").await.unwrap().is_empty());
+    assert_eq!(repo.get_stream_segments("new-log").await.unwrap().len(), 1);
+
+    // 单条删除：段随行走
+    repo.delete_log("new-log").await.unwrap();
+    assert!(repo.get_stream_segments("new-log").await.unwrap().is_empty());
+
+    // 全量清空
+    let mut again = full_log(None, Some("again"));
+    again.id = "again-log".into();
+    again.response_choices = Some("again-content".into());
+    repo.create_log_with_policy(&again, detailed_policy()).await.unwrap();
+    repo.delete_all_logs().await.unwrap();
+    assert!(repo.get_stream_segments("again-log").await.unwrap().is_empty());
+}

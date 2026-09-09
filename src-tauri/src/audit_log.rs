@@ -119,6 +119,13 @@ pub async fn cleanup_expired_logs(
         .bind(&cutoff)
         .execute(&mut *tx)
         .await?;
+        let segments = sqlx::query(
+            "DELETE FROM stream_segments WHERE log_id IN \
+             (SELECT id FROM request_logs WHERE created_at < ? LIMIT 500)",
+        )
+        .bind(&cutoff)
+        .execute(&mut *tx)
+        .await?;
         let rows = sqlx::query(
             "DELETE FROM request_logs WHERE id IN \
              (SELECT id FROM request_logs WHERE created_at < ? LIMIT 500)",
@@ -128,10 +135,10 @@ pub async fn cleanup_expired_logs(
         .await?;
         tx.commit().await?;
         deleted += rows.rows_affected();
+        let _ = (findings, segments);
         if rows.rows_affected() == 0 {
             break;
         }
-        let _ = findings;
     }
     Ok(deleted)
 }

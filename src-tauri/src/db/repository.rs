@@ -1,5 +1,5 @@
 use super::models::*;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 /// Parse the stored JSON endpoint list back into a Vec, or None when empty/absent.
 fn parse_eps(raw: &Option<String>) -> Option<Vec<String>> {
@@ -1263,7 +1263,114 @@ impl Repository {
         })
         .execute(&self.pool)
         .await?;
+        // 流式内容段（迁移 032）：detailed 策略下把流式累计内容同步落入溢出表，
+        // 日志详情与后续续传能力按 log_id 寻址；basic 尊重用户存储选择不落段。
+        // best-effort：段写入失败仅告警，不使主日志落账失败（主表行是权威记录）。
+        // Responses 协议除外：driver 轨对该协议做**逐帧渐进持久化**（携带
+        // response_id 续传锚点），本漏斗跳过以免同一流写两份内容。
+        if log.is_stream == 1
+            && log.mode != "responses"
+            && policy.detail_level == crate::audit_log::LogDetailLevel::Detailed
+        {
+            if let Some(content) = log.response_choices.as_deref() {
+                if !content.is_empty() {
+                    if let Err(error) = sqlx::query(
+                        "INSERT INTO stream_segments (log_id, seq, content, created_at) VALUES (?, 1, ?, ?)",
+                    )
+                    .bind(&log.id)
+                    .bind(content)
+                    .bind(&log.created_at)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        tracing::warn!("[流式段] 写入失败（不影响主日志）: {error}");
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// 读取某次流式请求的全部已生成内容段（按 seq 升序拼接即完整内容）。
+    pub async fn get_stream_segments(
+        &self,
+        log_id: &str,
+    ) -> Result<Vec<(i64, String)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT seq, content FROM stream_segments WHERE log_id = ? ORDER BY seq ASC",
+        )
+        .bind(log_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<i64, _>("seq"), row.get::<String, _>("content")))
+            .collect())
+    }
+
+    /// Responses 逐帧持久化：追加一帧下游 SSE 字节（best-effort，失败仅告警）。
+    pub async fn append_stream_frame(
+        &self,
+        log_id: &str,
+        seq: i64,
+        response_id: Option<&str>,
+        content: &str,
+        created_at: &str,
+    ) {
+        let mut query = sqlx::query(
+            "INSERT INTO stream_segments (log_id, seq, response_id, content, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(log_id)
+        .bind(seq);
+        query = match response_id {
+            Some(id) => query.bind(id),
+            None => query.bind(Option::<String>::None),
+        };
+        query = query.bind(content).bind(created_at);
+        if let Err(error) = query.execute(&self.pool).await {
+            tracing::warn!("[流式段] 逐帧写入失败（不影响流转发）: {error}");
+        }
+    }
+
+    /// 按续传锚点（上游 response.id）取未消费帧：seq > offset 升序。
+    pub async fn get_stream_frames_after(
+        &self,
+        response_id: &str,
+        offset: i64,
+    ) -> Result<Vec<(i64, String)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT seq, content FROM stream_segments \
+             WHERE response_id = ? AND seq > ? ORDER BY seq ASC",
+        )
+        .bind(response_id)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<i64, _>("seq"), row.get::<String, _>("content")))
+            .collect())
+    }
+
+    /// 续传锚点 → 首帧时间（TTL 判定）与关联日志行 id（完成状态判定）。
+    pub async fn find_stream_anchor(
+        &self,
+        response_id: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT log_id, created_at FROM stream_segments \
+             WHERE response_id = ? ORDER BY seq ASC LIMIT 1",
+        )
+        .bind(response_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                r.get::<String, _>("log_id"),
+                r.get::<String, _>("created_at"),
+            )
+        }))
     }
 
     pub async fn create_security_findings(
@@ -1320,6 +1427,10 @@ impl Repository {
             .bind(before_date)
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM stream_segments WHERE log_id IN (SELECT id FROM request_logs WHERE created_at < ?)")
+            .bind(before_date)
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE created_at < ?")
             .bind(before_date)
             .execute(&self.pool)
@@ -1331,6 +1442,9 @@ impl Repository {
         sqlx::query("DELETE FROM request_security_findings")
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM stream_segments")
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&self.pool)
             .await?;
@@ -1339,6 +1453,10 @@ impl Repository {
 
     pub async fn delete_log(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM request_security_findings WHERE log_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM stream_segments WHERE log_id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;

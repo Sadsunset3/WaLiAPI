@@ -10,7 +10,7 @@ use crate::protocol;
 use crate::security;
 use axum::{
     body::Body,
-    extract::{OriginalUri, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
@@ -2786,6 +2786,115 @@ pub async fn handle_messages_count_tokens(
 // ─── OpenAI Responses API: POST /v1/responses ────────────────────────────────
 // Accepts Responses API format and proxies to upstream channels via Chat Completions.
 // Converts: Responses input → OpenAI messages → upstream → OpenAI response → Responses output.
+
+/// Responses 断线续传回放：`GET /v1/responses/{response_id}/events?offset=N`。
+///
+/// 锚点为上游 response.id（逐帧持久化时透传提取）。回放 offset 之后的全部已存帧；
+/// 原流被客户端中断（无终止帧）时补一帧合成的 `response.completed`
+/// （status=incomplete）使客户端状态机干净收尾。TTL 过期返回 410 明确错误。
+/// 说明：客户端断开时上游即终止（与既有取消语义一致），本端点回放的是
+/// 断开前已生成的全部内容；「上游继续生成 + 活桥接」涉及流生命周期重构，
+/// 列为上游 issue 开放点。
+pub async fn handle_responses_events(
+    State(shared): State<SharedState>,
+    Path(response_id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let api_key = match protocol::extract_api_key(&headers) {
+        Some(key) => key,
+        None => {
+            return openai_auth_error(StatusCode::UNAUTHORIZED, "Missing API key");
+        }
+    };
+    let repo = Repository::new(shared.state.db.pool.clone());
+    let _key_record = match repo.get_api_key_by_key(&api_key).await {
+        Ok(key) => key,
+        Err(e) if is_key_lookup_storage_error(&e) => {
+            return openai_auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Key lookup failed");
+        }
+        Err(_) => return openai_auth_error(StatusCode::UNAUTHORIZED, "Invalid API key"),
+    };
+
+    let Some((log_id, first_created_at)) = (match repo.find_stream_anchor(&response_id).await {
+        Ok(anchor) => anchor,
+        Err(_) => return openai_auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Storage failure"),
+    }) else {
+        return openai_auth_error(StatusCode::NOT_FOUND, "Unknown response id");
+    };
+
+    // TTL：段可回放窗口（默认 24h，0 = 不限）
+    let ttl_secs = shared
+        .state
+        .settings
+        .get_u64("stream.resume_ttl_secs", 86_400);
+    if ttl_secs > 0 {
+        let expired = chrono::DateTime::parse_from_rfc3339(&first_created_at)
+            .ok()
+            .and_then(|t| t.timestamp_nanos_opt())
+            .map(|nanos| {
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() - nanos
+                    > ttl_secs as i64 * 1_000_000_000
+            })
+            .unwrap_or(false);
+        if expired {
+            return openai_auth_error(StatusCode::GONE, "Resume window expired");
+        }
+    }
+
+    let offset: i64 = params
+        .get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let frames = match repo.get_stream_frames_after(&response_id, offset).await {
+        Ok(frames) => frames,
+        Err(_) => return openai_auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Storage failure"),
+    };
+
+    let mut body = String::new();
+    for (_, frame) in &frames {
+        body.push_str(frame);
+    }
+    // 原流被中断（无终止帧）→ 合成 incomplete 完成帧收尾，客户端可干净终止。
+    let terminated = frames
+        .last()
+        .is_some_and(|(_, frame)| frame.contains("response.completed"));
+    if !terminated && !frames.is_empty() {
+        let synthesized = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "status": "incomplete",
+                "incomplete_details": {"reason": "client_disconnected"},
+            }
+        });
+        body.push_str(&format!(
+            "event: response.completed\ndata: {}\n\n",
+            synthesized
+        ));
+        tracing::debug!(
+            "[续传] {response_id} 原流未完成（log {log_id}），回放补合成 incomplete 终止帧"
+        );
+    }
+
+    (
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        [(header::CACHE_CONTROL, "no-cache")],
+        body,
+    )
+        .into_response()
+}
+
+/// OpenAI 风格的错误响应（续传端点用；独立于转发路径的错误构造器）。
+fn openai_auth_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {"message": message, "type": "invalid_request_error"}
+        })),
+    )
+        .into_response()
+}
 
 pub async fn handle_responses(
     State(shared): State<SharedState>,

@@ -505,6 +505,9 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "get_log_security_findings" => {
             to_json(commands::log::get_log_security_findings(arg(&args, "logId")?, state).await)
         }
+        "get_log_stream_segments" => {
+            to_json(commands::log::get_log_stream_segments(arg(&args, "logId")?, state).await)
+        }
         "get_log_stats" => to_json(commands::log::get_log_stats(arg(&args, "days")?, state).await),
         "delete_log" => to_json(commands::log::delete_log(arg(&args, "id")?, state).await),
         "delete_logs_before" => {

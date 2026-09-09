@@ -798,6 +798,7 @@ function LogDetail({ log }: { log: RequestLog }) {
   const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(new Set());
   const [copyingTool, setCopyingTool] = useState<string | null>(null);
   const [copiedJsonKey, setCopiedJsonKey] = useState<string | null>(null);
+  const [streamSegments, setStreamSegments] = useState<Array<{ seq: number; content: string }>>([]);
 
   useEffect(() => {
     if (log.risk_score > 0) {
@@ -806,6 +807,16 @@ function LogDetail({ log }: { log: RequestLog }) {
       setFindings([]);
     }
   }, [log.id, log.risk_score]);
+
+  // 流式请求懒加载已生成内容段（detailed 策略下由服务端随落账写入溢出表）
+  useEffect(() => {
+    if (log.is_stream) {
+      logApi.getStreamSegments(log.id).then(setStreamSegments).catch(() => setStreamSegments([]));
+    } else {
+      setStreamSegments([]);
+    }
+  }, [log.id, log.is_stream]);
+  const streamSegmentsText = streamSegments.map(s => s.content).join("");
 
   // Parse request body
   let parsed: Record<string, unknown> | null = null;
@@ -1794,6 +1805,31 @@ function LogDetail({ log }: { log: RequestLog }) {
           ) : (
             <div className="text-xs text-slate-500">点击「展开全部」查看原始 JSON</div>
           )}
+        </div>
+      ) : streamSegmentsText ? (
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-medium text-slate-500">流式生成内容（含中断前已生成部分，{streamSegments.length} 段）</span>
+            <button
+              onClick={async () => {
+                try {
+                  await writeClipboard(streamSegmentsText);
+                  setCopiedJsonKey('stream-segments');
+                  setTimeout(() => setCopiedJsonKey(null), 1500);
+                } catch {}
+              }}
+              className={`text-[10px] px-1.5 py-0.5 rounded-full transition-all shadow-sm ${
+                copiedJsonKey === 'stream-segments'
+                  ? 'bg-emerald-100 border-emerald-300 text-emerald-700'
+                  : 'bg-white/90 border border-slate-200 text-slate-600 hover:bg-blue-50 hover:text-blue-600 hover:border-blue-300'
+              }`}
+            >
+              {copiedJsonKey === 'stream-segments' ? '✅ 已复制' : '📋 复制'}
+            </button>
+          </div>
+          <pre className="max-h-[420px] w-full max-w-full overflow-y-auto overflow-x-hidden rounded-xl bg-slate-50 border border-slate-200 p-3 text-xs font-mono whitespace-pre-wrap break-all [overflow-wrap:anywhere] text-slate-700">
+            {streamSegmentsText}
+          </pre>
         </div>
       ) : (
         <div className="flex flex-col items-center justify-center py-8 text-center">
