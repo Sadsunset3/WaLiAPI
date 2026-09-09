@@ -39,7 +39,8 @@ pub(crate) fn emit_progress(
     );
 }
 
-/// Process an uploaded document: parse → split → embed → store
+/// Process an uploaded document: parse → split → embed → store.
+/// 重摄入/更新场景下自动按现存 chunk 哈希复用未变内容块的向量。
 #[allow(clippy::too_many_arguments)]
 pub async fn process_document(
     pool: &SqlitePool,
@@ -51,6 +52,48 @@ pub async fn process_document(
     embedding_model: Option<&str>,
     settings: &SettingsStore,
     data_dir: &Path,
+) -> Result<(), String> {
+    // 哈希复用映射：同文档现存 (content_hash → embedding)；新文档自然为空。
+    // 读取失败按空映射处理（复用是优化，不阻断主流程）。
+    let reuse = match KbRepository::new(pool.clone())
+        .get_chunk_hashes_by_doc(doc_id)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to load chunk hashes for reuse: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+    process_document_with_reuse(
+        pool,
+        events,
+        kb_id,
+        doc_id,
+        filename,
+        content,
+        embedding_model,
+        settings,
+        data_dir,
+        reuse,
+    )
+    .await
+}
+
+/// 同 `process_document`，但复用映射由调用方提供——`reindex_document`
+/// 先删旧 chunk 再重处理，必须在删除**前**捕获映射（删除后哈希就没了）。
+#[allow(clippy::too_many_arguments)]
+pub async fn process_document_with_reuse(
+    pool: &SqlitePool,
+    events: &EventSink,
+    kb_id: &str,
+    doc_id: &str,
+    filename: &str,
+    content: &[u8],
+    embedding_model: Option<&str>,
+    settings: &SettingsStore,
+    data_dir: &Path,
+    reuse_embeddings: std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
 
@@ -71,6 +114,7 @@ pub async fn process_document(
         embedding_model,
         settings,
         data_dir,
+        &reuse_embeddings,
     )
     .await;
 
@@ -95,6 +139,26 @@ pub async fn process_document(
     result
 }
 
+/// 哈希复用分流（纯函数，无 IO）：新分块内容哈希 vs 该文档现存
+/// (content_hash → embedding)，返回待嵌入下标与可直接复用的 (下标 → 向量字节)。
+/// 空向量字节的旧数据不参与复用（损坏数据回退重嵌）。
+pub(crate) fn split_chunks_for_embedding(
+    chunk_hashes: &[String],
+    existing: &std::collections::HashMap<String, Vec<u8>>,
+) -> (Vec<usize>, std::collections::HashMap<usize, Vec<u8>>) {
+    let mut to_embed = Vec::new();
+    let mut reused = std::collections::HashMap::new();
+    for (i, h) in chunk_hashes.iter().enumerate() {
+        match existing.get(h) {
+            Some(bytes) if !bytes.is_empty() => {
+                reused.insert(i, bytes.clone());
+            }
+            _ => to_embed.push(i),
+        }
+    }
+    (to_embed, reused)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_document_inner(
     pool: &SqlitePool,
@@ -106,6 +170,7 @@ async fn process_document_inner(
     embedding_model: Option<&str>,
     settings: &SettingsStore,
     data_dir: &Path,
+    reuse_embeddings: &std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
 
@@ -264,7 +329,7 @@ async fn process_document_inner(
     let total_chunks = chunks.len() as i64;
     let total_tokens: i64 = chunks.iter().map(|c| c.token_count as i64).sum();
 
-    // 3. Embed chunks in batches
+    // 3. Embed chunks in batches（内容未变的块复用既有向量，C-06/R1）
     let emb_model = embedding_model.unwrap_or(DEFAULT_EMBEDDING_MODEL);
     let main_repo = Repository::new(pool.clone());
 
@@ -280,13 +345,43 @@ async fn process_document_inner(
     } else {
         32
     };
-    println!("embedding_batch_size: {}", batch_size);
-    let total_batches = ((chunks.len() as f64) / batch_size as f64).ceil() as usize;
-    let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+
+    // 哈希复用：同一文档重处理时，内容未变的 chunk 直接沿用旧向量，不再
+    // 调用付费 embedding 渠道。维度与 KB 期望不符（如换过嵌入模型）或向量
+    // 损坏的旧数据不参与复用，回退重嵌。
+    let chunk_hashes: Vec<String> = chunks
+        .iter()
+        .map(|c| hex::encode(sha2::Sha256::digest(c.content.as_bytes())))
+        .collect();
+    let (mut to_embed, reused) = split_chunks_for_embedding(&chunk_hashes, reuse_embeddings);
+
+    let mut all_embeddings: Vec<Vec<f32>> = vec![Vec::new(); chunks.len()];
+    let mut reused_count = 0usize;
+    for (i, bytes) in &reused {
+        let decoded = retriever::decode_embedding(bytes);
+        let dim_ok = expected_dim.map(|d| decoded.len() == d).unwrap_or(true);
+        if decoded.is_empty() || !dim_ok {
+            to_embed.push(*i);
+        } else {
+            all_embeddings[*i] = decoded;
+            reused_count += 1;
+        }
+    }
+    to_embed.sort_unstable();
+    if reused_count > 0 {
+        tracing::info!(
+            "Reusing {} cached embeddings for doc {} ({} chunks to embed)",
+            reused_count,
+            doc_id,
+            to_embed.len()
+        );
+    }
+
+    let total_batches = ((to_embed.len() as f64) / batch_size as f64).ceil() as usize;
     let mut batch_done = 0usize;
 
-    for batch in chunks.chunks(batch_size) {
-        let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+    for batch in to_embed.chunks(batch_size) {
+        let texts: Vec<String> = batch.iter().map(|&i| chunks[i].content.clone()).collect();
         let embeddings = embedder::embed(&texts, emb_model, &main_repo).await?;
 
         // Validate embedding dimensions
@@ -304,10 +399,12 @@ async fn process_document_inner(
             }
         }
 
-        all_embeddings.extend(embeddings);
+        for (k, &i) in batch.iter().enumerate() {
+            all_embeddings[i] = embeddings[k].clone();
+        }
         batch_done += 1;
         // Embedding progress: 20% ~ 80%
-        let pct = 20 + ((batch_done as f64 / total_batches as f64) * 60.0) as u8;
+        let pct = 20 + ((batch_done as f64 / total_batches.max(1) as f64) * 60.0) as u8;
         emit_progress(
             events,
             doc_id,
@@ -357,6 +454,7 @@ async fn process_document_inner(
             embedding: embedding_bytes,
             embedding_dim: all_embeddings[i].len() as i64,
             metadata: serde_json::to_string(&chunk.metadata).unwrap_or_else(|_| "{}".to_string()),
+            content_hash: Some(chunk_hashes[i].clone()),
             created_at: now_iso(),
         };
         repo.create_chunk(&chunk_insert)
@@ -392,7 +490,9 @@ async fn process_document_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 6. Rebuild HNSW index (best-effort, non-blocking on failure)
+    // 6. Update vector index incrementally (best-effort, non-blocking on failure)
+    //    单文档增量（C-06/R1）：不再全库重建；索引缺失/旧格式时 delta 内部
+    //    自动回退全量 build_index。
     emit_progress(
         events,
         doc_id,
@@ -404,14 +504,19 @@ async fn process_document_inner(
     );
     let pool_clone = pool.clone();
     let kb_id_clone = kb_id.to_string();
+    let doc_id_clone = doc_id.to_string();
     let events_clone = events.clone();
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &events_clone).await {
+            if let Err(e) =
+                retriever::index_delta(&pool_clone, &kb_id_clone, &doc_id_clone, &events_clone)
+                    .await
+            {
                 tracing::warn!(
-                    "Failed to rebuild HNSW index for KB {} after doc: {}",
+                    "Failed to update HNSW index for KB {} after doc {}: {}",
                     kb_id_clone,
+                    doc_id_clone,
                     e
                 );
                 events_clone.emit(
@@ -419,7 +524,7 @@ async fn process_document_inner(
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
                         "status": "error",
-                        "message": format!("索引构建失败: {}", e)
+                        "message": format!("索引更新失败: {}", e)
                     }),
                 );
             } else {
@@ -428,7 +533,7 @@ async fn process_document_inner(
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
                         "status": "ready",
-                        "message": "索引构建完成"
+                        "message": "索引更新完成"
                     }),
                 );
             }
@@ -449,6 +554,15 @@ pub async fn reindex_document(
     let repo = KbRepository::new(pool.clone());
     let doc = repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
 
+    // 哈希复用映射必须在删除前捕获——删除后旧 chunk 的哈希就没了
+    let reuse = match repo.get_chunk_hashes_by_doc(doc_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to load chunk hashes before reindex: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
     // Delete existing chunks
     repo.delete_chunks_by_doc(doc_id)
         .await
@@ -464,7 +578,7 @@ pub async fn reindex_document(
     // Get KB for embedding model
     let kb = repo.get_kb(&doc.kb_id).await.map_err(|e| e.to_string())?;
 
-    process_document(
+    process_document_with_reuse(
         pool,
         events,
         &doc.kb_id,
@@ -474,6 +588,60 @@ pub async fn reindex_document(
         kb.embedding_model.as_deref(),
         settings,
         data_dir,
+        reuse,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_reuses_matching_hashes() {
+        let mut existing = std::collections::HashMap::new();
+        existing.insert("h1".to_string(), vec![1u8, 2, 3]);
+        existing.insert("h2".to_string(), vec![4, 5]);
+        let hashes = vec!["h1".to_string(), "h9".to_string(), "h2".to_string()];
+
+        let (to_embed, reused) = split_chunks_for_embedding(&hashes, &existing);
+
+        assert_eq!(to_embed, vec![1]);
+        assert_eq!(reused.len(), 2);
+        assert_eq!(reused[&0], vec![1, 2, 3]);
+        assert_eq!(reused[&2], vec![4, 5]);
+    }
+
+    #[test]
+    fn split_empty_existing_embeds_all() {
+        let hashes: Vec<String> = vec!["a".to_string(), "b".to_string()];
+        let (to_embed, reused) =
+            split_chunks_for_embedding(&hashes, &std::collections::HashMap::new());
+        assert_eq!(to_embed, vec![0, 1]);
+        assert!(reused.is_empty());
+    }
+
+    #[test]
+    fn split_skips_empty_embedding_bytes() {
+        let mut existing = std::collections::HashMap::new();
+        existing.insert("h1".to_string(), Vec::<u8>::new());
+        let hashes = vec!["h1".to_string()];
+
+        let (to_embed, reused) = split_chunks_for_embedding(&hashes, &existing);
+
+        assert_eq!(to_embed, vec![0]);
+        assert!(reused.is_empty());
+    }
+
+    #[test]
+    fn split_duplicate_content_reuses_same_embedding() {
+        let mut existing = std::collections::HashMap::new();
+        existing.insert("h1".to_string(), vec![9u8]);
+        let hashes = vec!["h1".to_string(), "h1".to_string()];
+
+        let (to_embed, reused) = split_chunks_for_embedding(&hashes, &existing);
+
+        assert!(to_embed.is_empty());
+        assert_eq!(reused.len(), 2);
+    }
 }

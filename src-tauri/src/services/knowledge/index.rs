@@ -16,6 +16,11 @@ use std::path::Path;
 pub struct IndexNode {
     /// External ID (maps to chunk ID in SQLite)
     pub id: String,
+    /// 所属文档 ID（增量索引按文档差集增删用）。
+    /// 注意：bincode 非自描述格式，旧版本索引文件缺此字段时加载会失败，
+    /// 由上层回退全量重建——serde(default) 兜不住跨格式的旧文件。
+    #[serde(default)]
+    pub doc_id: String,
     /// The embedding vector
     pub vector: Vec<f32>,
     /// Neighbour node indices (internal, not external IDs)
@@ -46,6 +51,10 @@ pub struct HnswIndex {
     pub entry_point: usize,
     /// Random state for level assignment (simplified: always layer 0)
     pub initialized: bool,
+    /// 已摘除节点的 chunk id 集合（墓碑）：检索结果过滤、len 扣减。
+    /// 图内不做物理摘除（会破坏 HNSW 连通性），压实只在全量 build 时发生。
+    #[serde(default)]
+    pub tombstones: HashSet<String>,
 }
 
 /// Priority queue item for greedy search.
@@ -87,11 +96,12 @@ impl HnswIndex {
             dim,
             entry_point: 0,
             initialized: false,
+            tombstones: HashSet::new(),
         }
     }
 
-    /// Build the index from a list of (id, vector) pairs.
-    pub fn build(&mut self, items: &[(String, Vec<f32>)]) {
+    /// Build the index from a list of (id, doc_id, vector) triples.
+    pub fn build(&mut self, items: &[(String, String, Vec<f32>)]) {
         self.build_with_progress(items, |_, _| {});
     }
 
@@ -99,18 +109,22 @@ impl HnswIndex {
     /// `callback(current, total)` is called periodically during construction.
     pub fn build_with_progress<F: Fn(usize, usize)>(
         &mut self,
-        items: &[(String, Vec<f32>)],
+        items: &[(String, String, Vec<f32>)],
         callback: F,
     ) {
         if items.is_empty() {
             return;
         }
 
+        // 全量重建 = 天然压实：输入来自库内现存行，墓碑一并清零
+        self.tombstones.clear();
+
         // Store all nodes
         self.nodes = items
             .iter()
-            .map(|(id, vec)| IndexNode {
+            .map(|(id, doc_id, vec)| IndexNode {
                 id: id.clone(),
+                doc_id: doc_id.clone(),
                 vector: vec.clone(),
                 neighbours: Vec::new(),
             })
@@ -191,15 +205,120 @@ impl HnswIndex {
         let ef = self.ef_search.max(k);
         let candidates = self.search_internal(query, ef, usize::MAX);
 
-        // Convert internal indices to external IDs and compute scores
+        // Convert internal indices to external IDs and compute scores.
+        // 墓碑节点（已摘除）在结果组装前过滤，保证 take(k) 全部是存活节点。
         candidates
             .into_iter()
+            .filter(|r| !self.tombstones.contains(&self.nodes[r.id].id))
             .take(k)
             .map(|r| SearchResult {
                 id: self.nodes[r.id].id.clone(),
                 score: 1.0 - r.distance, // Convert distance to similarity score
             })
             .collect()
+    }
+
+    /// 单点插入（增量索引用）：贪心下沉找最近邻、双向连边，不重排既有节点。
+    /// 返回 false 表示未插入（维度不符，或同 id 存活节点已存在——
+    /// 增量差集保证新 chunk id 全新，出现重复说明上游数据异常）。
+    pub fn insert(&mut self, id: &str, doc_id: &str, vector: &[f32]) -> bool {
+        if vector.len() != self.dim || self.contains_live(id) {
+            return false;
+        }
+        let new_idx = self.nodes.len();
+
+        // 空索引/未初始化：直接作为唯一节点（即入口点）
+        let neighbours: Vec<usize> = if !self.initialized || self.nodes.is_empty() {
+            Vec::new()
+        } else {
+            let ef = self.ef_construction.max(self.max_m);
+            self.search_internal(vector, ef, usize::MAX)
+                .into_iter()
+                .filter(|r| !self.tombstones.contains(&self.nodes[r.id].id))
+                .map(|r| r.id)
+                .take(self.max_m)
+                .collect()
+        };
+
+        self.nodes.push(IndexNode {
+            id: id.to_string(),
+            doc_id: doc_id.to_string(),
+            vector: vector.to_vec(),
+            neighbours: neighbours.clone(),
+        });
+
+        // 反向连边：未满直接加；已满则用新节点替换 host 当前最远邻居。
+        // 全量 build 会把多数节点的邻居表占满 max_m，只做「满则跳过」会
+        // 让新节点在图中不可达（贪心搜索没有任何边指向它）。
+        for &nb in &neighbours {
+            if nb >= new_idx {
+                continue;
+            }
+            let host_full = self.nodes[nb].neighbours.len() >= self.max_m;
+            if !host_full {
+                let host = &mut self.nodes[nb];
+                if !host.neighbours.contains(&new_idx) {
+                    host.neighbours.push(new_idx);
+                }
+                continue;
+            }
+            let host_vec = self.nodes[nb].vector.clone();
+            let mut worst: Option<(f32, usize)> = None; // (distance, position)
+            for (pos, &cand) in self.nodes[nb].neighbours.iter().enumerate() {
+                let d = cosine_distance(&host_vec, &self.nodes[cand].vector);
+                if worst.map(|(wd, _)| d > wd).unwrap_or(true) {
+                    worst = Some((d, pos));
+                }
+            }
+            if let Some((worst_d, pos)) = worst {
+                if cosine_distance(&host_vec, vector) < worst_d
+                    && !self.nodes[nb].neighbours.contains(&new_idx)
+                {
+                    self.nodes[nb].neighbours[pos] = new_idx;
+                }
+            }
+        }
+
+        if !self.initialized {
+            self.entry_point = new_idx;
+            self.initialized = true;
+        } else if self.tombstones.contains(&self.nodes[self.entry_point].id) {
+            // 入口点已被摘除：刷新为新节点，保证贪心搜索从存活节点出发
+            self.entry_point = new_idx;
+        }
+        true
+    }
+
+    /// 按 chunk id 摘除（墓碑）：检索不再返回、len 扣减。
+    /// 图内不做物理摘除，压实由全量 build 完成；节点不存在返回 false。
+    pub fn remove(&mut self, id: &str) -> bool {
+        if !self.contains_live(id) {
+            return false;
+        }
+        self.tombstones.insert(id.to_string());
+        true
+    }
+
+    /// 该文档当前存活的 chunk id 列表（增量差集的索引侧输入）
+    pub fn doc_node_ids(&self, doc_id: &str) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|n| n.doc_id == doc_id && !self.tombstones.contains(&n.id))
+            .map(|n| n.id.clone())
+            .collect()
+    }
+
+    /// 是否存在该 chunk id 的存活节点
+    pub fn contains_live(&self, id: &str) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.id == id && !self.tombstones.contains(&n.id))
+    }
+
+    /// 旧格式索引（节点无 doc_id）：增量路径应回退全量重建。
+    /// schema 中 chunk 的 doc_id 非空，因此「有节点且全空」即旧文件。
+    pub fn is_legacy_format(&self) -> bool {
+        self.initialized && !self.nodes.is_empty() && self.nodes.iter().all(|n| n.doc_id.is_empty())
     }
 
     /// Internal greedy search starting from the entry point.
@@ -310,9 +429,9 @@ impl HnswIndex {
         Self::from_bytes(&data)
     }
 
-    /// Get number of nodes.
+    /// Get number of live nodes (physical nodes minus tombstones).
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len() - self.tombstones.len()
     }
 
     /// Check if empty.
@@ -371,21 +490,21 @@ mod tests {
         let mut index = HnswIndex::new(3, 8, 50, 20);
 
         // Create 100 random-ish vectors
-        let items: Vec<(String, Vec<f32>)> = (0..100)
+        let items: Vec<(String, String, Vec<f32>)> = (0..100)
             .map(|i| {
                 let v = vec![
                     ((i as f32) * 0.1).sin(),
                     ((i as f32) * 0.2).cos(),
                     (i as f32) * 0.01,
                 ];
-                (format!("chunk-{}", i), v)
+                (format!("chunk-{}", i), format!("doc-{}", i % 5), v)
             })
             .collect();
 
         index.build(&items);
 
         // Search for a vector similar to item 5
-        let query = items[5].1.clone();
+        let query = items[5].2.clone();
         let results = index.search(&query, 5);
 
         assert!(!results.is_empty());
@@ -404,10 +523,11 @@ mod tests {
     #[test]
     fn test_serialization() {
         let mut index = HnswIndex::new(3, 8, 50, 20);
-        let items: Vec<(String, Vec<f32>)> = (0..10)
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
             .map(|i| {
                 (
                     format!("chunk-{}", i),
+                    format!("doc-{}", i % 3),
                     vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
                 )
             })
@@ -428,5 +548,208 @@ mod tests {
             assert_eq!(r1[i].id, r2[i].id);
             assert!((r1[i].score - r2[i].score).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_insert_then_search_finds_new_node() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..20)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![
+                        ((i as f32) * 0.1).sin(),
+                        ((i as f32) * 0.2).cos(),
+                        (i as f32) * 0.01,
+                    ],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        // 新增节点紧贴 item 3 的向量
+        let near3 = items[3].2.clone();
+        assert!(index.insert("chunk-new", "doc-new", &near3));
+        assert_eq!(index.len(), 21);
+
+        let results = index.search(&near3, 3);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"chunk-new"), "results: {:?}", ids);
+    }
+
+    #[test]
+    fn test_remove_tombstones_and_len() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        assert!(index.remove("chunk-5"));
+        assert!(!index.remove("chunk-5"), "double remove is a no-op");
+        assert!(!index.remove("chunk-missing"));
+        assert_eq!(index.len(), 9);
+
+        let query = items[5].2.clone();
+        let results = index.search(&query, 10);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains(&"chunk-5"), "tombstoned must not surface");
+    }
+
+    #[test]
+    fn test_remove_does_not_harm_other_recall() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..100)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    format!("doc-{}", i % 7),
+                    vec![
+                        ((i as f32) * 0.1).sin(),
+                        ((i as f32) * 0.2).cos(),
+                        (i as f32) * 0.01,
+                    ],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        // 摘掉若干无关节点后，查询点的 Top1 仍是自身
+        for i in [90usize, 91, 92, 93, 94, 95] {
+            assert!(index.remove(&format!("chunk-{}", i)));
+        }
+        let query = items[7].2.clone();
+        let results = index.search(&query, 5);
+        assert_eq!(results[0].id, "chunk-7");
+    }
+
+    #[test]
+    fn test_build_rebuild_compacts_tombstones() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+        index.remove("chunk-3");
+        index.remove("chunk-8");
+        assert_eq!(index.len(), 8);
+
+        // 全量重建压实：墓碑清零、节点全部复活（数据仍来自库内）
+        index.build(&items);
+        assert_eq!(index.len(), 10);
+        assert!(index.contains_live("chunk-3"));
+        assert!(index.contains_live("chunk-8"));
+    }
+
+    #[test]
+    fn test_doc_node_ids_and_legacy_detection() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..9)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    format!("doc-{}", i / 3),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        let mut d0 = index.doc_node_ids("doc-0");
+        d0.sort();
+        assert_eq!(d0, vec!["chunk-0", "chunk-1", "chunk-2"]);
+        assert!(!index.is_legacy_format());
+
+        // 摘除后 doc_node_ids 同步收缩
+        index.remove("chunk-1");
+        let mut d0 = index.doc_node_ids("doc-0");
+        d0.sort();
+        assert_eq!(d0, vec!["chunk-0", "chunk-2"]);
+
+        // 旧格式：节点存在但 doc_id 全空
+        let legacy_items: Vec<(String, String, Vec<f32>)> = (0..5)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    String::new(),
+                    vec![i as f32, 1.0, 2.0],
+                )
+            })
+            .collect();
+        let mut legacy = HnswIndex::new(3, 8, 50, 20);
+        legacy.build(&legacy_items);
+        assert!(legacy.is_legacy_format());
+    }
+
+    #[test]
+    fn test_insert_rejects_duplicate_and_dim_mismatch() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..5)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![i as f32, 1.0, 2.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        assert!(!index.insert("chunk-2", "doc-x", &[9.0, 9.0, 9.0]));
+        assert!(!index.insert("chunk-new", "doc-x", &[1.0, 2.0]));
+        assert_eq!(index.len(), 5);
+    }
+
+    #[test]
+    fn test_insert_into_uninitialized_index() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        assert!(index.insert("first", "doc-a", &[1.0, 0.0, 0.0]));
+        assert!(index.initialized);
+        assert_eq!(index.len(), 1);
+        let results = index.search(&[1.0, 0.0, 0.0], 1);
+        assert_eq!(results[0].id, "first");
+
+        // 摘除唯一节点后再插入：物理节点仍在（墓碑），新节点可正常服务检索
+        assert!(index.remove("first"));
+        assert!(index.insert("second", "doc-b", &[0.0, 1.0, 0.0]));
+        let results = index.search(&[0.0, 1.0, 0.0], 2);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["second"]);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_preserves_tombstones_and_doc_ids() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    format!("doc-{}", i % 2),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+        index.remove("chunk-4");
+        index.insert("chunk-new", "doc-9", &[4.0, 8.0, 12.0]);
+
+        let restored = HnswIndex::from_bytes(&index.to_bytes()).unwrap();
+        assert_eq!(restored.len(), index.len());
+        assert!(restored.tombstones.contains("chunk-4"));
+        assert!(restored.contains_live("chunk-new"));
+        assert_eq!(restored.doc_node_ids("doc-9"), vec!["chunk-new"]);
     }
 }

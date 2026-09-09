@@ -262,6 +262,97 @@ pub async fn detect_embedding_dim(pool: &SqlitePool, kb_id: &str) -> Result<Opti
 // Index management
 // ════════════════════════════════════════════════════════
 
+/// 按文档增量更新 HNSW 索引（C-06/R1）：库内该文档现存 chunk 与索引内
+/// 该文档节点做差集——多出 insert、消失墓碑。索引文件缺失 / 旧格式（节点
+/// 无 doc_id，bincode 跨格式不可读或读了无法定位文档）/ 索引已空 → 回退
+/// 全量 build_index。写回为文件整体覆盖（与全量构建同一交换模式，索引无
+/// 内存常驻状态）；调用方应置于 spawn_blocking（沿既有模式）。
+pub async fn index_delta(
+    pool: &SqlitePool,
+    kb_id: &str,
+    doc_id: &str,
+    events: &EventSink,
+) -> Result<(), String> {
+    let repo = KbRepository::new(pool.clone());
+    let path = index_path(kb_id);
+
+    let loaded = if path.exists() {
+        HnswIndex::load(&path)
+    } else {
+        Err("index file missing".to_string())
+    };
+
+    let mut index = match loaded {
+        Ok(i) if i.initialized && !i.is_legacy_format() && !i.is_empty() => i,
+        Ok(_) | Err(_) => {
+            // 索引缺失/旧格式/已掏空：回退全量重建（进度事件由 build_index 发出）
+            tracing::info!(
+                "Falling back to full index build for KB {} (doc {} delta)",
+                kb_id,
+                doc_id
+            );
+            return build_index(pool, kb_id, events).await;
+        }
+    };
+
+    // 库侧现存向量（维度不符的丢弃，与全量构建同语义）
+    let chunks = repo
+        .get_chunk_vectors_by_doc(doc_id)
+        .await
+        .map_err(|e| format!("Failed to load chunk vectors: {}", e))?;
+    let current: Vec<(String, Vec<f32>)> = chunks
+        .iter()
+        .filter_map(|(id, blob)| {
+            let v = decode_embedding(blob);
+            (v.len() == index.dim).then(|| (id.clone(), v))
+        })
+        .collect();
+
+    // 差集：索引有、库无 → 墓碑；库有、索引无 → 插入
+    let current_ids: std::collections::HashSet<String> =
+        current.iter().map(|(id, _)| id.clone()).collect();
+    let mut removed = 0usize;
+    for id in index.doc_node_ids(doc_id) {
+        if !current_ids.contains(&id) && index.remove(&id) {
+            removed += 1;
+        }
+    }
+    let mut inserted = 0usize;
+    for (id, vector) in &current {
+        if !index.contains_live(id) && index.insert(id, doc_id, vector) {
+            inserted += 1;
+        }
+    }
+
+    index
+        .save(&path)
+        .map_err(|e| format!("Failed to save index: {}", e))?;
+
+    repo.upsert_index_meta(
+        kb_id,
+        index.dim as i64,
+        index.len() as i64,
+        Some(path.to_str().unwrap_or("")),
+        "ready",
+    )
+    .await
+    .map_err(|e| format!("Failed to update index meta: {}", e))?;
+    repo.update_kb_index_status(kb_id, "ready")
+        .await
+        .map_err(|e| format!("Failed to update KB index status: {}", e))?;
+
+    tracing::info!(
+        "Incremental index update for KB {} doc {}: +{} -{}, {} live nodes",
+        kb_id,
+        doc_id,
+        inserted,
+        removed,
+        index.len()
+    );
+
+    Ok(())
+}
+
 /// Build HNSW index for a KB from all its chunks.
 /// Emits `kb-index-progress` Tauri events with percentage.
 pub async fn build_index(pool: &SqlitePool, kb_id: &str, events: &EventSink) -> Result<(), String> {
@@ -276,12 +367,12 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, events: &EventSink) -> 
         return Err("No chunks to index".to_string());
     }
 
-    // Build (chunk_id, vector) pairs
-    let mut items: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
+    // Build (chunk_id, doc_id, vector) triples
+    let mut items: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(chunks.len());
     let mut dim = 0;
 
     tracing::info!("Building HNSW index, processing {} chunks...", chunks.len());
-    for (id, _, _, emb, _, _) in chunks.iter() {
+    for (id, _, _, emb, _, doc_id) in chunks.iter() {
         let vector = decode_embedding(emb);
         if !vector.is_empty() {
             if dim == 0 {
@@ -289,7 +380,7 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, events: &EventSink) -> 
                 tracing::debug!("Detected embedding dimension: {}", dim);
             }
             if vector.len() == dim {
-                items.push((id.clone(), vector));
+                items.push((id.clone(), doc_id.clone(), vector));
             }
         }
     }
@@ -715,7 +806,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-fn decode_embedding(blob: &[u8]) -> Vec<f32> {
+pub fn decode_embedding(blob: &[u8]) -> Vec<f32> {
     bincode::deserialize(blob).unwrap_or_default()
 }
 
@@ -811,5 +902,187 @@ mod fts_defense_tests {
                 "查询 {query:?} 应无错返回空结果，实际: {result:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod index_delta_tests {
+    use super::*;
+    use crate::services::knowledge::repository::ChunkInsert;
+
+    async fn delta_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn sink() -> EventSink {
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        EventSink::headless(tx)
+    }
+
+    async fn seed_kb(pool: &SqlitePool, kb_id: &str) {
+        let now = "2026-09-08T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO kb_knowledge_bases (id, name, created_at, updated_at) VALUES (?, 'delta-test', ?, ?)",
+        )
+        .bind(kb_id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_doc(pool: &SqlitePool, kb_id: &str, doc_id: &str) {
+        let now = "2026-09-08T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO kb_documents (id, kb_id, filename, file_type, content_hash, status, source_type, doc_meta, created_at, updated_at) \
+             VALUES (?, ?, 'f.txt', 'text', ?, 'ready', 'upload', '{}', ?, ?)",
+        )
+        .bind(doc_id)
+        .bind(kb_id)
+        .bind(doc_id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn add_chunk(pool: &SqlitePool, kb_id: &str, doc_id: &str, chunk_id: &str, seed: f32) {
+        let vector = vec![seed.sin(), seed.cos(), seed * 0.01];
+        KbRepository::new(pool.clone())
+            .create_chunk(&ChunkInsert {
+                id: chunk_id.to_string(),
+                doc_id: doc_id.to_string(),
+                kb_id: kb_id.to_string(),
+                chunk_index: 0,
+                content: format!("content {}", chunk_id),
+                token_count: 1,
+                embedding: encode_embedding(&vector),
+                embedding_dim: vector.len() as i64,
+                metadata: "{}".to_string(),
+                content_hash: None,
+                created_at: "2026-09-08T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn query_vec(seed: f32) -> Vec<f32> {
+        vec![seed.sin(), seed.cos(), seed * 0.01]
+    }
+
+    /// C-06/R1：单文档增/删/整删走 delta 后，索引状态与全量重建等价。
+    #[tokio::test]
+    async fn delta_add_update_delete_roundtrip() {
+        let pool = delta_pool().await;
+        let events = sink();
+        let kb_id = format!("kb-delta-{}", uuid::Uuid::new_v4());
+        seed_kb(&pool, &kb_id).await;
+        seed_doc(&pool, &kb_id, "doc-a").await;
+        seed_doc(&pool, &kb_id, "doc-b").await;
+
+        for i in 0..8 {
+            add_chunk(&pool, &kb_id, "doc-a", &format!("a-{}", i), i as f32 * 0.3).await;
+        }
+        for i in 0..6 {
+            add_chunk(
+                &pool,
+                &kb_id,
+                "doc-b",
+                &format!("b-{}", i),
+                5.0 + i as f32 * 0.3,
+            )
+            .await;
+        }
+
+        build_index(&pool, &kb_id, &events).await.unwrap();
+
+        // doc-a 变更：删两块、加三块（新 chunk id，模拟重处理）
+        sqlx::query("DELETE FROM kb_chunks WHERE id IN ('a-0', 'a-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            add_chunk(
+                &pool,
+                &kb_id,
+                "doc-a",
+                &format!("a-n{}", i),
+                2.0 + i as f32 * 0.2,
+            )
+            .await;
+        }
+        index_delta(&pool, &kb_id, "doc-a", &events).await.unwrap();
+
+        // doc-b 整删（FK 级联删 chunk）
+        sqlx::query("DELETE FROM kb_documents WHERE id = 'doc-b'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        index_delta(&pool, &kb_id, "doc-b", &events).await.unwrap();
+
+        let index = HnswIndex::load(&index_path(&kb_id)).unwrap();
+        assert!(!index.contains_live("a-0"), "removed chunk must be gone");
+        assert!(!index.contains_live("a-1"));
+        assert!(index.contains_live("a-n0"), "added chunk must be live");
+        assert!(index.contains_live("a-n2"));
+        assert!(index.contains_live("a-7"), "untouched chunk survives");
+        assert!(
+            index.doc_node_ids("doc-b").is_empty(),
+            "deleted doc has no live nodes"
+        );
+
+        // 检索可用：新块向量查询应在新块中命中
+        let results = index.search(&query_vec(2.0), 3);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"a-n0"), "search results: {:?}", ids);
+
+        std::fs::remove_file(index_path(&kb_id)).ok();
+    }
+
+    /// C-06/R1：索引缺失或旧格式（无 doc_id）时 delta 回退全量重建。
+    #[tokio::test]
+    async fn delta_falls_back_to_full_build() {
+        let pool = delta_pool().await;
+        let events = sink();
+        let kb_id = format!("kb-delta-fb-{}", uuid::Uuid::new_v4());
+        seed_kb(&pool, &kb_id).await;
+        seed_doc(&pool, &kb_id, "doc-a").await;
+        add_chunk(&pool, &kb_id, "doc-a", "a-0", 0.5).await;
+        add_chunk(&pool, &kb_id, "doc-a", "a-1", 1.5).await;
+
+        // 场景 1：索引文件不存在 → delta 后建立
+        index_delta(&pool, &kb_id, "doc-a", &events).await.unwrap();
+        let index = HnswIndex::load(&index_path(&kb_id)).unwrap();
+        assert!(index.contains_live("a-0") && index.contains_live("a-1"));
+
+        // 场景 2：旧格式索引（节点无 doc_id）→ delta 回退全量重建
+        let legacy_items: Vec<(String, String, Vec<f32>)> = vec![
+            ("a-0".into(), String::new(), query_vec(0.5)),
+            ("a-1".into(), String::new(), query_vec(1.5)),
+        ];
+        let mut legacy = HnswIndex::new(3, 16, 200, 50);
+        legacy.build(&legacy_items);
+        legacy.save(&index_path(&kb_id)).unwrap();
+        assert!(HnswIndex::load(&index_path(&kb_id))
+            .unwrap()
+            .is_legacy_format());
+
+        index_delta(&pool, &kb_id, "doc-a", &events).await.unwrap();
+        let rebuilt = HnswIndex::load(&index_path(&kb_id)).unwrap();
+        assert!(
+            !rebuilt.is_legacy_format(),
+            "fallback rebuild populates doc ids"
+        );
+        assert!(rebuilt.contains_live("a-0"));
+        assert_eq!(rebuilt.doc_node_ids("doc-a").len(), 2);
+
+        std::fs::remove_file(index_path(&kb_id)).ok();
     }
 }

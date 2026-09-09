@@ -349,8 +349,8 @@ impl KbRepository {
         let symbol_kind = meta.get("symbol_kind").and_then(|v| v.as_str());
 
         sqlx::query(
-            "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, content_hash, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&chunk.id)
         .bind(&chunk.doc_id)
@@ -363,10 +363,46 @@ impl KbRepository {
         .bind(&chunk.metadata)
         .bind(symbol_name)
         .bind(symbol_kind)
+        .bind(&chunk.content_hash)
         .bind(&chunk.created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 该文档现存 chunk 的 (content_hash → embedding) 映射，供重处理时
+    /// 复用未变内容块的向量（仅含 content_hash 与 embedding 均非空的行）。
+    pub async fn get_chunk_hashes_by_doc(
+        &self,
+        doc_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, sqlx::Error> {
+        let rows: Vec<(Option<String>, Vec<u8>)> = sqlx::query_as(
+            "SELECT content_hash, embedding FROM kb_chunks \
+             WHERE doc_id = ? AND content_hash IS NOT NULL AND embedding IS NOT NULL",
+        )
+        .bind(doc_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(h, e)| h.map(|h| (h, e)))
+            .collect())
+    }
+
+    /// 该文档现存 chunk 的 (chunk_id, embedding)（文档 ready 且向量非空），
+    /// 增量索引差集的库侧输入。
+    pub async fn get_chunk_vectors_by_doc(
+        &self,
+        doc_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT c.id, c.embedding FROM kb_chunks c \
+             JOIN kb_documents d ON c.doc_id = d.id \
+             WHERE c.doc_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'",
+        )
+        .bind(doc_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn delete_chunks_by_doc(&self, doc_id: &str) -> Result<(), sqlx::Error> {
@@ -654,6 +690,8 @@ pub struct ChunkInsert {
     pub embedding: Vec<u8>,
     pub embedding_dim: i64,
     pub metadata: String,
+    /// chunk 内容 SHA-256（C-06/R1 哈希复用）；旧行为 None
+    pub content_hash: Option<String>,
     pub created_at: String,
 }
 
