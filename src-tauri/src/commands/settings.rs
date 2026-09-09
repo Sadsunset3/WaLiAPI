@@ -72,6 +72,22 @@ pub struct Settings {
     pub otlp_interval_secs: u64,
     #[serde(default = "default_otlp_batch_size")]
     pub otlp_batch_size: u64,
+    /// 渠道主动健康探测开关（默认开）。关闭时零后台流量。
+    #[serde(default = "default_true")]
+    pub probe_enabled: bool,
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+    /// 语义缓存开关（C-02，默认关）。关闭时拦截/写入/清理全部旁路。
+    #[serde(default = "default_false")]
+    pub cache_enabled: bool,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// 语义层相似度阈值（百分比，95 = 0.95；保守默认）。
+    #[serde(default = "default_cache_threshold")]
+    pub cache_threshold_percent: u64,
+    /// 语义层嵌入模型（空 = 只启用 exact 层）。
+    #[serde(default)]
+    pub cache_embedding_model: String,
 }
 
 fn default_otlp_interval_secs() -> u64 {
@@ -79,6 +95,15 @@ fn default_otlp_interval_secs() -> u64 {
 }
 fn default_otlp_batch_size() -> u64 {
     50
+}
+fn default_probe_interval_secs() -> u64 {
+    300
+}
+fn default_cache_ttl_secs() -> u64 {
+    86_400
+}
+fn default_cache_threshold() -> u64 {
+    95
 }
 
 fn default_port() -> u16 {
@@ -160,6 +185,12 @@ impl Default for Settings {
             otlp_headers: String::new(),
             otlp_interval_secs: default_otlp_interval_secs(),
             otlp_batch_size: default_otlp_batch_size(),
+            probe_enabled: default_true(),
+            probe_interval_secs: default_probe_interval_secs(),
+            cache_enabled: default_false(),
+            cache_ttl_secs: default_cache_ttl_secs(),
+            cache_threshold_percent: default_cache_threshold(),
+            cache_embedding_model: String::new(),
         }
     }
 }
@@ -248,6 +279,12 @@ pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Sett
         otlp_headers: get_str(store, "otlp.headers", ""),
         otlp_interval_secs: get_u64(store, "otlp.export_interval_secs", 30),
         otlp_batch_size: get_u64(store, "otlp.batch_size", 50),
+        probe_enabled: get_bool(store, "probe.enabled", true),
+        probe_interval_secs: get_u64(store, "probe.interval_secs", 300),
+        cache_enabled: get_bool(store, "cache.semantic_enabled", false),
+        cache_ttl_secs: get_u64(store, "cache.ttl_secs", 86_400),
+        cache_threshold_percent: get_u64(store, "cache.semantic_threshold_percent", 95),
+        cache_embedding_model: get_str(store, "cache.embedding_model", ""),
     };
     Ok(settings)
 }
@@ -380,6 +417,30 @@ pub async fn save_settings(
             "otlp.batch_size".to_string(),
             serde_json::json!(settings.otlp_batch_size),
         ),
+        (
+            "probe.enabled".to_string(),
+            serde_json::json!(settings.probe_enabled),
+        ),
+        (
+            "probe.interval_secs".to_string(),
+            serde_json::json!(settings.probe_interval_secs),
+        ),
+        (
+            "cache.semantic_enabled".to_string(),
+            serde_json::json!(settings.cache_enabled),
+        ),
+        (
+            "cache.ttl_secs".to_string(),
+            serde_json::json!(settings.cache_ttl_secs),
+        ),
+        (
+            "cache.semantic_threshold_percent".to_string(),
+            serde_json::json!(settings.cache_threshold_percent),
+        ),
+        (
+            "cache.embedding_model".to_string(),
+            serde_json::json!(settings.cache_embedding_model),
+        ),
     ])?;
     crate::audit_log::apply_settings(&state.settings);
     // 缩短保留期后立即清理，避免等待后台维护周期。
@@ -421,4 +482,15 @@ pub async fn set_auto_start(enabled: bool, app: AppHandle) -> Result<(), String>
         }
         Ok(())
     }
+}
+
+/// 清空语义缓存（C-02 管理命令）：model 为 None 时清全部，否则按模型清。
+#[tauri::command]
+pub async fn clear_semantic_cache(
+    model: Option<String>,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<u64, String> {
+    crate::semantic_cache::clear(&state.db.pool, model.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }

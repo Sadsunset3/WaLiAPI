@@ -43,6 +43,10 @@ export interface Channel {
   updated_at: string;
   last_test_at: string | null;
   last_test_ok: number | null;
+  /** 主动健康探测（迁移 033）：探测列优先展示，无探测数据回退手动测试列。 */
+  last_probe_at: string | null;
+  last_probe_ok: number | null;
+  probe_latency_ms: number | null;
   /** Multi-key: extra API keys (masked in DTO, use getChannelExtraKeys for full). */
   extra_keys: ChannelKey[];
 }
@@ -440,6 +444,14 @@ export interface Settings {
   otlp_headers: string;
   otlp_interval_secs: number;
   otlp_batch_size: number;
+  // 渠道主动健康探测
+  probe_enabled: boolean;
+  probe_interval_secs: number;
+  // 语义缓存（C-02，默认关闭）
+  cache_enabled: boolean;
+  cache_ttl_secs: number;
+  cache_threshold_percent: number;
+  cache_embedding_model: string;
 }
 
 // Security rule types
@@ -644,4 +656,14 @@ export interface UpstreamModelsResult {
   protocol: ChannelProtocol | string;
   /** 拉取时使用的根 URL（便于展示/排障）。 */
   base_url: string;
+}
+
+// Prompt 模板（C-07 版本化管理）
+export interface PromptTemplate {
+  id: string;
+  template_key: string;
+  version: number;
+  content: string;
+  active: boolean;
+  created_at: string;
 }

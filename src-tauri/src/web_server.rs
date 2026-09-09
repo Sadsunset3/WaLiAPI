@@ -114,6 +114,10 @@ pub async fn run(cfg: WebServerConfig) -> Result<(), String> {
         data_dir,
     });
 
+    // Prompt 模板种子（C-07）：空表时写入源码字面量 v1——升级后行为逐字节不变
+    if let Err(error) = crate::prompt_templates::seed_if_empty(&state.db.pool).await {
+        tracing::warn!("[模板] 种子写入失败（运行时回退编译期默认）: {error}");
+    }
     crate::audit_log::apply_settings(&state.settings);
     tauri::async_runtime::spawn(crate::audit_log::run_maintenance_loop(
         state.db.pool.clone(),
@@ -124,6 +128,17 @@ pub async fn run(cfg: WebServerConfig) -> Result<(), String> {
     tauri::async_runtime::spawn(crate::otlp_exporter::run_export_loop(
         state.db.pool.clone(),
         state.settings.clone(),
+    ));
+
+    // 渠道主动健康探测（默认开启 300s 一轮，可整体关闭）
+    tauri::async_runtime::spawn(crate::health_probe::run_probe_loop(
+        state.db.pool.clone(),
+        state.settings.clone(),
+    ));
+
+    // 语义缓存过期清理（C-02；缓存未启用时清理为空操作）
+    tauri::async_runtime::spawn(crate::semantic_cache::run_maintenance_loop(
+        state.db.pool.clone(),
     ));
 
     tauri::async_runtime::spawn(crate::auth_provider::maintenance::run_maintenance_loop(

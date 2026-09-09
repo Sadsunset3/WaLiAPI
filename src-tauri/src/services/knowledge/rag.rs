@@ -4,6 +4,7 @@ use super::repository::KbRepository;
 use super::retriever;
 use crate::core::proxy;
 use crate::db::repository::Repository;
+use crate::prompt_templates;
 use crate::settings_store::SettingsStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -55,6 +56,18 @@ pub async fn ask_with_config(
 ) -> Result<RagAnswer, String> {
     let repo = Repository::new(pool.clone());
     let kb_repo = KbRepository::new(pool.clone());
+    // 融合模式（C-06/R3）：RRF 默认（消量纲），weighted 保留可配回退
+    let fusion_mode = retriever::FusionMode::parse(&settings.get_str("kb.fusion_mode", "rrf"));
+
+    // C-06/R2：可选多轮查询改写（kb.query_rewrite，默认关）。
+    // 多轮对话的指代型问题（「上面说的方案呢」）直接送检索必然 miss——
+    // 开启时先用渠道模型把「近几轮对话 + 当前问题」改写成独立完整的检索查询。
+    // 失败/超时静默回退原查询（best-effort），多一次 LLM 调用的成本由开关控制。
+    let query = if settings.get_bool("kb.query_rewrite", false) && !history.is_empty() {
+        rewrite_query_with_llm(pool, settings, kb_id, chat_model, query, history).await
+    } else {
+        query.to_string()
+    };
 
     // 1. Embed the query (needed for vector and hybrid modes)
     let query_emb_opt = if search_mode != "keyword" {
@@ -81,15 +94,16 @@ pub async fn ask_with_config(
             retriever::hybrid_search_with_details(
                 pool,
                 kb_id,
-                query,
+                &query,
                 &embeddings[0],
                 top_k,
                 vector_weight,
                 keyword_weight,
+                fusion_mode,
             )
             .await?
         } else {
-            let kw = retriever::keyword_only_search(pool, kb_id, query, top_k).await?;
+            let kw = retriever::keyword_only_search(pool, kb_id, &query, top_k).await?;
             kw.into_iter()
                 .map(|r| {
                     let score = r.score;
@@ -146,15 +160,26 @@ pub async fn ask_with_config(
             retriever::hybrid_search_with_details(
                 pool,
                 kb_id,
-                query,
+                &query,
                 query_emb,
                 top_k,
                 vector_weight,
                 keyword_weight,
+                fusion_mode,
             )
             .await?
         }
     };
+
+    // C-06/R3 第二步：可选 LLM listwise 重排（`kb.rerank_enabled`，默认关）。
+    // 走网关自身的渠道跑渠道（proxy::handle_request，kb-internal 路由组），
+    // 重排调用的 token 消耗自动计入请求日志；失败静默回退原序（best-effort）。
+    let scored_results =
+        if settings.get_bool("kb.rerank_enabled", false) && scored_results.len() > 1 {
+            rerank_with_llm(pool, settings, kb_id, chat_model, &query, scored_results).await
+        } else {
+            scored_results
+        };
 
     // Extract plain results for context building
     let results: Vec<super::models::SearchResult> =
@@ -165,7 +190,7 @@ pub async fn ask_with_config(
         if !kb_id.is_empty() {
             let answer = "RAG 中没有找到相关内容。".to_string();
             kb_repo
-                .add_conversation(kb_id, "user", query, None, Some(chat_model), 0)
+                .add_conversation(kb_id, "user", &query, None, Some(chat_model), 0)
                 .await
                 .ok();
             kb_repo
@@ -191,7 +216,7 @@ pub async fn ask_with_config(
     let context = build_context(&results);
 
     // 4. Build prompt with history
-    let prompt = build_rag_prompt(&context, query, history);
+    let prompt = build_rag_prompt(&context, &query, history);
 
     // 5. Token estimation and fallback
     let estimated_tokens = retriever::estimate_tokens(&prompt);
@@ -200,11 +225,14 @@ pub async fn ask_with_config(
 
     let (final_prompt, context_used) = if estimated_tokens > context_limit {
         // Stage 1: Trim context (remove lowest-scoring chunks)
-        let trimmed = trim_context(&results, query, history, context_limit);
+        let trimmed = trim_context(&results, &query, history, context_limit);
         if retriever::estimate_tokens(&trimmed.0) > context_limit {
             // Stage 2: Remove history, keep only latest message
-            let no_history =
-                build_rag_prompt(&context, query, &history[history.len().saturating_sub(2)..]);
+            let no_history = build_rag_prompt(
+                &context,
+                &query,
+                &history[history.len().saturating_sub(2)..],
+            );
             if retriever::estimate_tokens(&no_history) > context_limit {
                 // Stage 3: Remove context entirely
                 let bare = format!(
@@ -229,11 +257,12 @@ pub async fn ask_with_config(
         context_used
     );
 
-    // 6. Call LLM via proxy
+    // 6. Call LLM via proxy（系统提示词走模板表：激活版本优先，回退编译期默认）
+    let rag_system_prompt = prompt_templates::load(pool, prompt_templates::KEY_RAG_SYSTEM).await;
     let chat_request = serde_json::json!({
         "model": chat_model,
         "messages": [
-            {"role": "system", "content": "你是 RAG 助手。基于检索到的内容回答问题。回答要准确、简洁，并标注信息来源。如果没有相关信息，请明确说明。"},
+            {"role": "system", "content": rag_system_prompt},
             {"role": "user", "content": final_prompt}
         ],
         "stream": false
@@ -308,7 +337,7 @@ pub async fn ask_with_config(
                 let sources_json = serde_json::to_string(&sources).ok();
                 let tokens = usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0);
                 kb_repo
-                    .add_conversation(kb_id, "user", query, None, Some(chat_model), 0)
+                    .add_conversation(kb_id, "user", &query, None, Some(chat_model), 0)
                     .await
                     .ok();
                 kb_repo
@@ -499,10 +528,12 @@ pub async fn deep_research(
                     .join("\n"),
             );
 
+            let next_query_system =
+                prompt_templates::load(pool, prompt_templates::KEY_RESEARCH_NEXT_QUERY).await;
             let follow_up_request = serde_json::json!({
                 "model": chat_model,
                 "messages": [
-                    {"role": "system", "content": "你是一个研究助手，根据已有发现生成下一步搜索查询。只返回查询本身。"},
+                    {"role": "system", "content": next_query_system},
                     {"role": "user", "content": follow_up_prompt}
                 ],
                 "stream": false
@@ -566,51 +597,28 @@ pub async fn deep_research(
             .join("\n");
 
         let round_prompt = if round == 0 {
-            format!(
-                r#"你是一个深度研究助手。请分析以下 RAG 内容，并给出初步发现。
-
-原始问题: {query}
-
-<knowledge_base>
-{context}
-</knowledge_base>
-
-请完成：
-1. 理解问题的核心需求
-2. 从 RAG 中提取相关信息
-3. 给出初步发现
-4. 如果信息不足，指出还需要哪些方面"#,
-                query = query,
-                context = context,
-            )
+            let template =
+                prompt_templates::load(pool, prompt_templates::KEY_DEEP_RESEARCH_ROUND0).await;
+            prompt_templates::render(&template, &[("query", query), ("context", &context)])
         } else {
-            format!(
-                r#"继续深度研究。
-
-原始问题: {query}
-
-已有发现:
-{findings}
-
-新检索到的内容:
-<knowledge_base>
-{context}
-</knowledge_base>
-
-请完成：
-1. 分析新内容与已有发现的关系
-2. 补充或修正之前的发现
-3. 指出是否需要继续研究"#,
-                query = query,
-                findings = findings_str,
-                context = context,
+            let template =
+                prompt_templates::load(pool, prompt_templates::KEY_DEEP_RESEARCH_ROUND_NEXT).await;
+            prompt_templates::render(
+                &template,
+                &[
+                    ("query", query),
+                    ("findings", &findings_str),
+                    ("context", &context),
+                ],
             )
         };
 
+        let deep_research_system =
+            prompt_templates::load(pool, prompt_templates::KEY_DEEP_RESEARCH_SYSTEM).await;
         let chat_request = serde_json::json!({
             "model": chat_model,
             "messages": [
-                {"role": "system", "content": "你是深度研究助手。基于 RAG 内容进行多轮迭代研究，逐步深入分析。"},
+                {"role": "system", "content": deep_research_system},
                 {"role": "user", "content": round_prompt}
             ],
             "stream": false
@@ -669,23 +677,17 @@ pub async fn deep_research(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let final_prompt = format!(
-        r#"基于多轮深度研究的发现，请综合回答原始问题。
-
-原始问题: {query}
-
-多轮研究发现:
-{findings}
-
-请综合所有发现，给出完整、准确的回答。标注信息来源。"#,
-        query = query,
-        findings = findings_summary,
+    let final_prompt = prompt_templates::render(
+        &prompt_templates::load(pool, prompt_templates::KEY_DEEP_RESEARCH_FINAL).await,
+        &[("query", query), ("findings", &findings_summary)],
     );
 
+    let final_system =
+        prompt_templates::load(pool, prompt_templates::KEY_DEEP_RESEARCH_FINAL_SYSTEM).await;
     let final_request = serde_json::json!({
         "model": chat_model,
         "messages": [
-            {"role": "system", "content": "你是深度研究助手。综合多轮研究发现，给出完整准确的回答。"},
+            {"role": "system", "content": final_system},
             {"role": "user", "content": final_prompt}
         ],
         "stream": false
@@ -764,5 +766,287 @@ pub async fn deep_research(
             })
         }
         Err((code, msg)) => Err(format!("Final synthesis failed ({}): {}", code, msg)),
+    }
+}
+
+// ─── C-06/R2：多轮查询改写 ─────────────────────────────────────────────────
+
+/// 从改写回复中提取查询（纯函数）：取首个非空行、去引号包裹、截断到 512 字符。
+/// 空回复/全空白 → None（调用侧回退原查询）。
+fn extract_rewrite_query(reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.trim_matches(|c| c == '"' || c == '“' || c == '”');
+    if line.is_empty() {
+        return None;
+    }
+    Some(line.chars().take(512).collect())
+}
+
+/// 可选查询改写：近几轮对话 + 当前问题 → 独立完整检索查询。
+/// 走渠道模型（kb-internal 路由组，token 消耗自动落账）；任何失败静默回退原查询。
+async fn rewrite_query_with_llm(
+    pool: &SqlitePool,
+    settings: &SettingsStore,
+    kb_id: &str,
+    chat_model: &str,
+    query: &str,
+    history: &[ConversationMessage],
+) -> String {
+    // 近 6 轮（改写只需消解指代，更早的轮次是噪音）
+    let recent: Vec<String> = history
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect();
+    let history_text = recent.join("\n");
+    let prompt = prompt_templates::render(
+        &prompt_templates::load(pool, prompt_templates::KEY_QUERY_REWRITE).await,
+        &[("history", &history_text), ("query", query)],
+    );
+    let chat_request = serde_json::json!({
+        "model": chat_model,
+        "messages": [
+            {"role": "system", "content": "你是检索查询改写器，只输出改写后的查询本身。"},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": false,
+        "temperature": 0.0
+    });
+    let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
+    let proxy_result = proxy::handle_request(
+        &std::sync::Arc::new(Repository::new(pool.clone())),
+        settings,
+        "kb-rewrite",
+        "RAG-rewrite",
+        chat_request,
+        false,
+        Some(chat_request_str),
+        Some(format!("kb-internal_{}", kb_id)),
+        None,
+    )
+    .await;
+
+    let reply = match proxy_result {
+        Ok(result) => result
+            .body
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => String::new(),
+    };
+    match extract_rewrite_query(&reply) {
+        Some(rewritten) => {
+            tracing::debug!("[RAG] 查询改写: {query:?} -> {rewritten:?}");
+            rewritten
+        }
+        None => {
+            tracing::warn!("[RAG] 查询改写回复不可解析，回退原查询");
+            query.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+
+    /// 门控键契约（ask_with_config 内联表达式）：键名与默认值锁定——
+    /// 键名打错会让改写误开（成本意外增加）或永不生效；默认必须为关。
+    #[test]
+    fn query_rewrite_gate_defaults_off_and_key_is_stable() {
+        let dir =
+            std::env::temp_dir().join(format!("waliapi-rewrite-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::settings_store::SettingsStore::file(dir.join("settings.json"));
+
+        // 未配置 → 关（默认值契约）
+        assert!(
+            !store.get_bool("kb.query_rewrite", false),
+            "kb.query_rewrite 默认必须为关"
+        );
+        // 开启表达式（ask_with_config 内联条件的镜像）：关闭或无历史 → 不进入改写
+        let gate = store.get_bool("kb.query_rewrite", false);
+        assert!(!(gate && !Vec::<ConversationMessage>::new().is_empty()));
+        assert!(!gate, "关闭时检索路径零变化（结构性跳过改写）");
+    }
+
+    #[test]
+    fn extract_rewrite_query_takes_first_line_and_trims_quotes() {
+        assert_eq!(
+            extract_rewrite_query("WaLiAPI 网关如何配置渠道配额\n（改写说明）"),
+            Some("WaLiAPI 网关如何配置渠道配额".to_string())
+        );
+        assert_eq!(
+            extract_rewrite_query("  \"带引号的查询\"  "),
+            Some("带引号的查询".to_string())
+        );
+        assert_eq!(
+            extract_rewrite_query("“中文引号”"),
+            Some("中文引号".to_string())
+        );
+        // 空白/空行 → None
+        assert_eq!(extract_rewrite_query(""), None);
+        assert_eq!(extract_rewrite_query(" \n \n"), None);
+        // 超长截断
+        let long = "长".repeat(600);
+        assert_eq!(
+            extract_rewrite_query(&long).map(|q| q.chars().count()),
+            Some(512)
+        );
+    }
+
+    /// 改写关闭（默认）或无历史 → 走原查询（结构性保障：分支条件在 ask_with_config 内联，
+    /// 此处锁定 extract 的回退语义与 rewrite 的失败回退）。
+    #[tokio::test]
+    async fn rewrite_falls_back_to_original_when_no_channels() {
+        // 内存库无任何渠道 → proxy 转发必然失败 → 回退原查询（不 panic、不报错）
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let settings = SettingsStore::file(
+            std::env::temp_dir().join(format!("waliapi-rewrite-test-{}", uuid::Uuid::new_v4())),
+        );
+        let history = vec![
+            ConversationMessage {
+                role: "user".into(),
+                content: "WaLiAPI 的渠道配额怎么配？".into(),
+            },
+            ConversationMessage {
+                role: "assistant".into(),
+                content: "在密钥页设置 quota_limit。".into(),
+            },
+        ];
+        let result =
+            rewrite_query_with_llm(&pool, &settings, "kb-1", "m", "那限流呢？", &history).await;
+        assert_eq!(result, "那限流呢？", "上游不可用时必须静默回退原查询");
+    }
+}
+
+// ─── C-06/R3 第二步：LLM listwise 重排 ─────────────────────────────────────
+
+/// 解析重排回复为候选顺序（纯函数）：
+/// 容忍前后杂文（截取首个 [ 到最后一个 ]）；编号越界/重复丢弃；
+/// 未出现的候选按原序补尾——保证输出恒为原候选的全排列。
+fn parse_rerank_order(reply: &str, len: usize) -> Option<Vec<usize>> {
+    let start = reply.find('[')?;
+    let end = reply.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    let parsed: Vec<i64> = serde_json::from_str(&reply[start..=end]).ok()?;
+    let mut order: Vec<usize> = Vec::with_capacity(len);
+    for index in parsed {
+        let index = index as usize;
+        if index < len && !order.contains(&index) {
+            order.push(index);
+        }
+    }
+    for i in 0..len {
+        if !order.contains(&i) {
+            order.push(i);
+        }
+    }
+    Some(order)
+}
+
+/// 可选 LLM 重排：把 top 候选拼给渠道模型打分重排（用渠道跑渠道）。
+/// 失败/关闭不影响主流程——原序返回，仅 tracing 告警。
+async fn rerank_with_llm(
+    pool: &SqlitePool,
+    settings: &crate::settings_store::SettingsStore,
+    kb_id: &str,
+    chat_model: &str,
+    query: &str,
+    candidates: Vec<retriever::ScoredSearchResult>,
+) -> Vec<retriever::ScoredSearchResult> {
+    let mut listing = String::new();
+    for (i, c) in candidates.iter().enumerate() {
+        let excerpt: String = c
+            .result
+            .content
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .replace('\n', " ");
+        listing.push_str(&format!("[{}] {}: {}\n", i, c.result.filename, excerpt));
+    }
+    let prompt = format!(
+        "你是检索结果重排器。根据查询对候选片段按相关性从高到低排序。\n\n查询：{query}\n\n候选片段：\n{listing}\n只返回一个 JSON 数组，元素为候选编号、按相关性从高到低排列，例如 [2,0,1]。不要输出其他内容。"
+    );
+    let chat_request = serde_json::json!({
+        "model": chat_model,
+        "messages": [
+            {"role": "system", "content": "你是检索重排器，只输出 JSON 数组。"},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": false,
+        "temperature": 0.0
+    });
+    let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
+    let proxy_result = proxy::handle_request(
+        &std::sync::Arc::new(crate::db::repository::Repository::new(pool.clone())),
+        settings,
+        "kb-rerank",
+        "RAG-rerank",
+        chat_request,
+        false,
+        Some(chat_request_str),
+        Some(format!("kb-internal_{}", kb_id)),
+        None,
+    )
+    .await;
+
+    let reply = match proxy_result {
+        Ok(result) => result
+            .body
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => String::new(),
+    };
+    match parse_rerank_order(&reply, candidates.len()) {
+        Some(order) => {
+            let mut reordered = Vec::with_capacity(candidates.len());
+            for index in order {
+                reordered.push(candidates[index].clone());
+            }
+            tracing::debug!("[RAG] LLM 重排生效（{} 候选）", reordered.len());
+            reordered
+        }
+        None => {
+            tracing::warn!("[RAG] LLM 重排回复不可解析，回退原序（相关性排序）");
+            candidates
+        }
+    }
+}
+
+#[cfg(test)]
+mod rerank_tests {
+    use super::*;
+
+    #[test]
+    fn parse_rerank_order_extracts_json_and_validates() {
+        // 纯 JSON
+        assert_eq!(parse_rerank_order("[2,0,1]", 3), Some(vec![2, 0, 1]));
+        // 前后杂文容忍
+        assert_eq!(
+            parse_rerank_order("排序结果：[1, 2, 0] 以上。", 3),
+            Some(vec![1, 2, 0])
+        );
+        // 越界丢弃 + 缺失补尾（全排列保证）
+        assert_eq!(parse_rerank_order("[5,0,5]", 3), Some(vec![0, 1, 2]));
+        assert_eq!(parse_rerank_order("[1]", 3), Some(vec![1, 0, 2]));
+        // 不可解析 → None
+        assert_eq!(parse_rerank_order("no json here", 3), None);
+        assert_eq!(parse_rerank_order("[]", 3), Some(vec![0, 1, 2]));
     }
 }
