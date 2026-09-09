@@ -447,6 +447,11 @@ export interface Settings {
   // 渠道主动健康探测
   probe_enabled: boolean;
   probe_interval_secs: number;
+  // 语义缓存（C-02，默认关闭）
+  cache_enabled: boolean;
+  cache_ttl_secs: number;
+  cache_threshold_percent: number;
+  cache_embedding_model: string;
 }
 
 // Security rule types

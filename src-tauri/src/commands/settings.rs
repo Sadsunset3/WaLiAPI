@@ -77,6 +77,17 @@ pub struct Settings {
     pub probe_enabled: bool,
     #[serde(default = "default_probe_interval_secs")]
     pub probe_interval_secs: u64,
+    /// 语义缓存开关（C-02，默认关）。关闭时拦截/写入/清理全部旁路。
+    #[serde(default = "default_false")]
+    pub cache_enabled: bool,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// 语义层相似度阈值（百分比，95 = 0.95；保守默认）。
+    #[serde(default = "default_cache_threshold")]
+    pub cache_threshold_percent: u64,
+    /// 语义层嵌入模型（空 = 只启用 exact 层）。
+    #[serde(default)]
+    pub cache_embedding_model: String,
 }
 
 fn default_otlp_interval_secs() -> u64 {
@@ -87,6 +98,12 @@ fn default_otlp_batch_size() -> u64 {
 }
 fn default_probe_interval_secs() -> u64 {
     300
+}
+fn default_cache_ttl_secs() -> u64 {
+    86_400
+}
+fn default_cache_threshold() -> u64 {
+    95
 }
 
 fn default_port() -> u16 {
@@ -170,6 +187,10 @@ impl Default for Settings {
             otlp_batch_size: default_otlp_batch_size(),
             probe_enabled: default_true(),
             probe_interval_secs: default_probe_interval_secs(),
+            cache_enabled: default_false(),
+            cache_ttl_secs: default_cache_ttl_secs(),
+            cache_threshold_percent: default_cache_threshold(),
+            cache_embedding_model: String::new(),
         }
     }
 }
@@ -260,6 +281,10 @@ pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Sett
         otlp_batch_size: get_u64(store, "otlp.batch_size", 50),
         probe_enabled: get_bool(store, "probe.enabled", true),
         probe_interval_secs: get_u64(store, "probe.interval_secs", 300),
+        cache_enabled: get_bool(store, "cache.semantic_enabled", false),
+        cache_ttl_secs: get_u64(store, "cache.ttl_secs", 86_400),
+        cache_threshold_percent: get_u64(store, "cache.semantic_threshold_percent", 95),
+        cache_embedding_model: get_str(store, "cache.embedding_model", ""),
     };
     Ok(settings)
 }
@@ -400,6 +425,22 @@ pub async fn save_settings(
             "probe.interval_secs".to_string(),
             serde_json::json!(settings.probe_interval_secs),
         ),
+        (
+            "cache.semantic_enabled".to_string(),
+            serde_json::json!(settings.cache_enabled),
+        ),
+        (
+            "cache.ttl_secs".to_string(),
+            serde_json::json!(settings.cache_ttl_secs),
+        ),
+        (
+            "cache.semantic_threshold_percent".to_string(),
+            serde_json::json!(settings.cache_threshold_percent),
+        ),
+        (
+            "cache.embedding_model".to_string(),
+            serde_json::json!(settings.cache_embedding_model),
+        ),
     ])?;
     crate::audit_log::apply_settings(&state.settings);
     // 缩短保留期后立即清理，避免等待后台维护周期。
@@ -441,4 +482,25 @@ pub async fn set_auto_start(enabled: bool, app: AppHandle) -> Result<(), String>
         }
         Ok(())
     }
+}
+
+/// 清空语义缓存（C-02 管理命令）：model 为 None 时清全部，否则按模型清。
+#[tauri::command]
+pub async fn clear_semantic_cache(
+    model: Option<String>,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<u64, String> {
+    let pool = &state.db.pool;
+    let result = match model.as_deref() {
+        Some(m) if !m.is_empty() => sqlx::query("DELETE FROM semantic_cache WHERE model = ?")
+            .bind(m)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?,
+        _ => sqlx::query("DELETE FROM semantic_cache")
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    Ok(result.rows_affected())
 }

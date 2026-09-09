@@ -584,3 +584,8 @@ export const promptTemplateApi = {
   create: (templateKey: string, content: string) => invoke<number>("create_prompt_template", { templateKey, content }),
   activate: (templateKey: string, version: number) => invoke<void>("activate_prompt_template", { templateKey, version }),
 };
+
+// 语义缓存管理命令（C-02）
+export const semanticCacheApi = {
+  clear: (model?: string) => invoke<number>("clear_semantic_cache", { model: model ?? null }),
+};
