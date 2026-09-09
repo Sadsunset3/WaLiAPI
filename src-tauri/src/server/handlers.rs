@@ -1306,6 +1306,7 @@ async fn native_anthropic_request(
     let mut request = client
         .post(url)
         .header("x-api-key", &config.api_key)
+        .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json");
     for (name, value) in forwarded_anthropic_headers(headers) {
         request = request.header(name, value);

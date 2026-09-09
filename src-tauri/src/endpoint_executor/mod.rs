@@ -566,6 +566,61 @@ pub fn classify_upstream_status(status: u16, body: &str) -> Option<FailureClass>
     crate::core::attempt::classify_http_status_with_body(status, Some(body))
 }
 
+/// Detect an Anthropic error envelope even when a compatible gateway returns
+/// HTTP 2xx.  Several Claude gateways encode capacity/overload as
+/// `{"type":"error","error":{...}}` with a successful transport status.
+/// Keep this parser deliberately conservative: ordinary successful Messages
+/// responses have `type=message` and are never classified as errors.
+pub fn anthropic_error_envelope_message(body: &Value) -> Option<String> {
+    let is_error = body.get("type").and_then(Value::as_str) == Some("error")
+        || body
+            .get("error")
+            .is_some_and(|error| error.is_object() || error.is_string());
+    if !is_error {
+        return None;
+    }
+    let error = body.get("error").unwrap_or(body);
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .unwrap_or("error");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or("Anthropic upstream returned an error")
+        .chars()
+        .take(300)
+        .collect::<String>();
+    Some(format!("{kind}: {message}"))
+}
+
+/// Parse a bounded response body and detect an Anthropic error envelope.
+pub fn anthropic_error_envelope_from_bytes(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| anthropic_error_envelope_message(&value))
+}
+
+/// Inspect one complete Anthropic SSE record for an error event/envelope.
+pub fn anthropic_stream_error_message(record: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(record).ok()?;
+    let event_error = text.lines().any(|line| line.trim() == "event: error");
+    let mut data = String::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push_str(value.trim_start());
+        }
+    }
+    let envelope = anthropic_error_envelope_from_bytes(data.as_bytes());
+    if event_error {
+        return envelope.or_else(|| Some("error: Anthropic upstream stream error".to_string()));
+    }
+    envelope
+}
+
 /// Build a classified [`AttemptFailure`] from an upstream non-2xx.
 ///
 /// `retry_after_secs` — when the upstream returned a `Retry-After` header,
@@ -895,6 +950,7 @@ pub async fn dispatch_executor(
     // Snapshot headers for the success path AND the decode-failure diagnostics
     // before `bytes()` consumes the response.
     let response_headers = safe_response_headers(resp.headers());
+    let retry_after = retry_after_from_headers(resp.headers()).map(|d| d.as_secs());
     let content_encoding = resp
         .headers()
         .get(reqwest::header::CONTENT_ENCODING)
@@ -959,6 +1015,22 @@ pub async fn dispatch_executor(
             }
         }
     };
+    if attempt.upstream_protocol == "anthropic"
+        && (200..300).contains(&status)
+        && anthropic_error_envelope_message(&body).is_some()
+    {
+        let message = anthropic_error_envelope_message(&body)
+            .unwrap_or_else(|| "Anthropic upstream returned a 2xx error envelope".to_string());
+        return AttemptResult::Failure(AttemptFailure {
+            failure_class: FailureClass::Retryable,
+            message,
+            // A 2xx transport carrying an error envelope is not a successful
+            // downstream response.  Expose the gateway failure status while
+            // retaining the original body message for diagnostics.
+            status_code: Some(502),
+            retry_after,
+        });
+    }
     // Legacy Gemini override: the upstream `generateContent` response must be
     // converted back to OpenAI Chat (this is the ONLY executor that converts
     // responses; it is selected exclusively via identity override).
@@ -1247,6 +1319,31 @@ mod tests {
         assert_eq!(
             auth_headers(AuthScheme::OptionalBearer, "k"),
             vec![("authorization".to_string(), "Bearer k".to_string())]
+        );
+    }
+
+    #[test]
+    fn anthropic_error_envelopes_include_overload_and_ignore_messages_success() {
+        let error = serde_json::json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Selected model is at capacity."}
+        });
+        assert_eq!(
+            anthropic_error_envelope_message(&error).as_deref(),
+            Some("overloaded_error: Selected model is at capacity.")
+        );
+        assert!(anthropic_error_envelope_message(&serde_json::json!({
+            "type": "message", "content": [], "stop_reason": "end_turn"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_error_envelope_is_detected_before_commit() {
+        let record = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        assert_eq!(
+            anthropic_stream_error_message(record).as_deref(),
+            Some("overloaded_error: busy")
         );
     }
 

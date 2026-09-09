@@ -911,6 +911,34 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                                 continue;
                             }
                         };
+                        if attempt.upstream_protocol == "anthropic" {
+                            if let Some(message) =
+                                crate::endpoint_executor::anthropic_stream_error_message(
+                                    &first_frame,
+                                )
+                            {
+                                let failure = AttemptFailure {
+                                    failure_class: FailureClass::Retryable,
+                                    message: format!("Anthropic upstream stream error: {message}"),
+                                    status_code: Some(502),
+                                    retry_after: None,
+                                };
+                                if let Some(channel_id) = health_channel_id.as_deref() {
+                                    record_channel_mode_outcome(
+                                        repo,
+                                        channel_id,
+                                        endpoint.as_str(),
+                                        true,
+                                        &crate::core::attempt::AttemptResult::Failure(
+                                            failure.clone(),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                flow.record_failure(&failure);
+                                continue;
+                            }
+                        }
 
                         let mut supervisor =
                             crate::core::stream_supervisor::StreamSupervisor::new();
