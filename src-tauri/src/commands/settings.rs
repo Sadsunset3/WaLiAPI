@@ -59,6 +59,26 @@ pub struct Settings {
     pub ocr_concurrency: i32,
     #[serde(default = "default_ocr_dpi")]
     pub ocr_dpi: i32,
+    /// OTLP 导出开关（默认关）。关闭时后台导出循环零流量。
+    #[serde(default = "default_false")]
+    pub otlp_enabled: bool,
+    /// OTLP/HTTP JSON 端点（如 Langfuse 的 /api/public/otel/v1/traces）。
+    #[serde(default)]
+    pub otlp_endpoint: String,
+    /// OTLP 附加请求头，JSON 对象字符串（鉴权头从设置读取，不入源码）。
+    #[serde(default)]
+    pub otlp_headers: String,
+    #[serde(default = "default_otlp_interval_secs")]
+    pub otlp_interval_secs: u64,
+    #[serde(default = "default_otlp_batch_size")]
+    pub otlp_batch_size: u64,
+}
+
+fn default_otlp_interval_secs() -> u64 {
+    30
+}
+fn default_otlp_batch_size() -> u64 {
+    50
 }
 
 fn default_port() -> u16 {
@@ -135,6 +155,11 @@ impl Default for Settings {
             ocr_max_pages: default_ocr_max_pages(),
             ocr_concurrency: default_ocr_concurrency(),
             ocr_dpi: default_ocr_dpi(),
+            otlp_enabled: default_false(),
+            otlp_endpoint: String::new(),
+            otlp_headers: String::new(),
+            otlp_interval_secs: default_otlp_interval_secs(),
+            otlp_batch_size: default_otlp_batch_size(),
         }
     }
 }
@@ -218,6 +243,11 @@ pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Sett
         ocr_max_pages: get_u64(store, "ocr.max_pages", 200) as i32,
         ocr_concurrency: get_u64(store, "ocr.concurrency", 2) as i32,
         ocr_dpi: get_u64(store, "ocr.dpi", 200) as i32,
+        otlp_enabled: get_bool(store, "otlp.enabled", false),
+        otlp_endpoint: get_str(store, "otlp.endpoint", ""),
+        otlp_headers: get_str(store, "otlp.headers", ""),
+        otlp_interval_secs: get_u64(store, "otlp.export_interval_secs", 30),
+        otlp_batch_size: get_u64(store, "otlp.batch_size", 50),
     };
     Ok(settings)
 }
@@ -330,6 +360,26 @@ pub async fn save_settings(
             serde_json::json!(settings.ocr_concurrency),
         ),
         ("ocr.dpi".to_string(), serde_json::json!(settings.ocr_dpi)),
+        (
+            "otlp.enabled".to_string(),
+            serde_json::json!(settings.otlp_enabled),
+        ),
+        (
+            "otlp.endpoint".to_string(),
+            serde_json::json!(settings.otlp_endpoint),
+        ),
+        (
+            "otlp.headers".to_string(),
+            serde_json::json!(settings.otlp_headers),
+        ),
+        (
+            "otlp.export_interval_secs".to_string(),
+            serde_json::json!(settings.otlp_interval_secs),
+        ),
+        (
+            "otlp.batch_size".to_string(),
+            serde_json::json!(settings.otlp_batch_size),
+        ),
     ])?;
     crate::audit_log::apply_settings(&state.settings);
     // 缩短保留期后立即清理，避免等待后台维护周期。

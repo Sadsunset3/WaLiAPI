@@ -80,7 +80,10 @@ mod tests {
         assert_eq!(sanitize(""), None);
         assert_eq!(sanitize("   "), None);
         assert_eq!(sanitize(&"a".repeat(129)), None);
-        assert_eq!(sanitize(&"a".repeat(128)).as_deref(), Some("a".repeat(128).as_str()));
+        assert_eq!(
+            sanitize(&"a".repeat(128)).as_deref(),
+            Some("a".repeat(128).as_str())
+        );
     }
 
     #[test]
@@ -105,7 +108,10 @@ mod tests {
     #[test]
     fn resolve_generates_uuid_when_absent() {
         let id = resolve(&headers(&[]));
-        assert!(uuid::Uuid::parse_str(&id).is_ok(), "应生成合法 UUIDv4：{id}");
+        assert!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "应生成合法 UUIDv4：{id}"
+        );
     }
 
     #[test]
