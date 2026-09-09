@@ -170,7 +170,8 @@ export function LoginModal({
       {needsChoice && !loginMethod && <div className="mt-5 space-y-3">
         <p className="text-sm font-medium">选择登录方式</p>
         <button type="button" disabled={!isDesktop} onClick={() => setLoginMethod("browser_callback")} className="w-full rounded-xl border border-border p-4 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-55"><span className="block text-sm font-semibold">浏览器 OAuth</span><span className="mt-1 block text-xs text-muted-foreground">{isDesktop ? "通过本机 localhost 回调完成授权" : "仅桌面端支持 localhost 回调"}</span></button>
-        <button type="button" onClick={() => setLoginMethod("device_code")} className="w-full rounded-xl border border-border p-4 text-left hover:bg-muted"><span className="block text-sm font-semibold">Device Code</span><span className="mt-1 block text-xs text-muted-foreground">在任意设备打开授权页并输入一次性代码，适用于 Web / Docker</span></button>
+        <button type="button" onClick={() => setLoginMethod("device_code")} className="w-full rounded-xl border border-border p-4 text-left hover:bg-muted"><span className="block text-sm font-semibold">设备代码授权（Device Code）</span><span className="mt-1 block text-xs text-muted-foreground">在任意设备打开授权页并输入一次性代码，适用于 Web / Docker</span></button>
+        <p className="rounded-xl bg-primary/10 px-3 py-2.5 text-xs leading-5 text-primary">首次使用前，请登录 ChatGPT Web，依次进入“设置 → 账户 → 安全与登录”，打开“为 Codex 启用设备代码授权”。</p>
       </div>}
       {loginMethod && <>
       <ol className="mt-5 space-y-3" aria-label="登录步骤">{steps.map((step, index) => { const complete = state === "done" || index < currentStep; const active = state === "running" && index === currentStep; return <li key={step} className="flex items-center gap-3 rounded-xl border border-border bg-muted/35 px-3 py-2.5 text-sm"><span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${complete ? "bg-success text-white" : active ? "bg-primary text-primary-foreground" : "bg-card text-muted-foreground"}`}>{complete ? <Check size={14} /> : active ? <Loader2 size={14} className="animate-spin" /> : index + 1}</span><span className={active ? "font-medium" : "text-muted-foreground"}>{step}</span></li>; })}</ol>
@@ -184,7 +185,7 @@ export function LoginModal({
       {error && <p role="alert" className="mt-4 flex items-center gap-2 rounded-xl bg-destructive/10 px-3 py-2.5 text-sm text-destructive"><CircleAlert size={15} />{error}</p>}
       {state === "done" && <p className="mt-4 rounded-xl bg-success/10 px-3 py-2.5 text-sm text-success">账号已保存。{currentStep === 5 ? "模型同步已完成。" : ""}</p>}
       </>}
-      {error && isDevice && <p className="mt-2 text-xs leading-5 text-muted-foreground">若 Device Code 未启用，请检查 ChatGPT 个人安全设置或 Workspace 管理员权限；也可改用 auth.json 导入。</p>}
+      {error && isDevice && <p className="mt-2 text-xs leading-5 text-muted-foreground">请登录 ChatGPT Web，进入“设置 → 账户 → 安全与登录”，确认已打开“为 Codex 启用设备代码授权”。Workspace 用户可能还需联系管理员开启权限；也可改用 auth.json 导入。</p>}
       <div className="mt-6 flex justify-end gap-2">{state === "running" ? <button onClick={() => void cancel()} className="action-secondary">取消登录</button> : state !== "done" && <button onClick={onClose} className="action-secondary">取消</button>}{state === "done" ? <button onClick={onClose} className="action-primary">完成</button> : <button onClick={() => void login()} disabled={state === "running" || !loginMethod} className="action-primary">{state === "running" ? "登录中…" : "开始登录"}</button>}</div>
     </div>
   </div>;
