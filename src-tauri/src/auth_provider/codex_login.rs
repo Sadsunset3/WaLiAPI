@@ -140,6 +140,18 @@ struct DeviceTokenResponse {
     code_verifier: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DevicePollErrorEnvelope {
+    #[serde(default)]
+    error: DevicePollError,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DevicePollError {
+    #[serde(default)]
+    code: String,
+}
+
 impl ExtraTokenFields for CodexTokenFields {}
 
 type CodexOauthClient = Client<
@@ -412,6 +424,21 @@ impl CodexLogin {
                 Ok(response) if response.status() == StatusCode::NOT_FOUND => {
                     transient_failures = 0;
                 }
+                Ok(response) if response.status() == StatusCode::FORBIDDEN => {
+                    let code = response
+                        .json::<DevicePollErrorEnvelope>()
+                        .await
+                        .ok()
+                        .map(|body| body.error.code)
+                        .unwrap_or_default();
+                    match code.as_str() {
+                        "deviceauth_authorization_pending" => transient_failures = 0,
+                        "deviceauth_authorization_denied" | "access_denied" => {
+                            return Err(ProviderError::AuthorizationDenied);
+                        }
+                        _ => return Err(ProviderError::DeviceAuthorizationFailed),
+                    }
+                }
                 Ok(response) if response.status().is_server_error() => {
                     transient_failures = transient_failures.saturating_add(1);
                     if transient_failures > 5 {
@@ -419,12 +446,7 @@ impl CodexLogin {
                     }
                     interval = (interval.saturating_mul(2)).min(30);
                 }
-                Ok(response)
-                    if matches!(
-                        response.status(),
-                        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
-                    ) =>
-                {
+                Ok(response) if matches!(response.status(), StatusCode::UNAUTHORIZED) => {
                     return Err(ProviderError::AuthorizationDenied);
                 }
                 Ok(_) => return Err(ProviderError::DeviceAuthorizationFailed),
@@ -1369,7 +1391,13 @@ mod tests {
         assert_eq!(body["device_auth_id"], "private-device-auth-id");
         assert_eq!(body["user_code"], "ABCD-EFGH");
         if state.polls.fetch_add(1, Ordering::SeqCst) == 0 {
-            return (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({
+                    "error": {"code": "deviceauth_authorization_pending"}
+                })),
+            )
+                .into_response();
         }
         (
             StatusCode::OK,
