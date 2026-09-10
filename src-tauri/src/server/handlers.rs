@@ -325,6 +325,7 @@ mod auth_routeplan_rollout_tests {
             disabled: 0,
             priority: 1,
             weight: 1,
+            sort_order: 0,
             quota_json: None,
             model_states_json: json!({
                 "version": 1,
@@ -2358,6 +2359,7 @@ pub async fn handle_messages(
                                 &merged_security,
                                 false,
                                 usage,
+                                trace_id.clone(),
                             )
                             .await;
                             let mut builder = Response::builder().status(status);
@@ -4865,6 +4867,7 @@ mod list_models_tests {
             disabled: 0,
             priority: 0,
             weight: 1,
+            sort_order: 0,
             quota_json: None,
             model_states_json: serde_json::json!({
                 "version": 1,
@@ -5056,6 +5059,7 @@ mod list_models_tests {
         let api_key = repo
             .create_api_key(&CreateApiKeyInput {
                 name: "test-key".to_string(),
+                key: None,
                 allowed_models: None,
                 allowed_channels: None,
                 denied_models: None,

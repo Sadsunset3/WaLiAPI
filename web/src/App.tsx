@@ -108,11 +108,13 @@ function App() {
                   <Route path="/api-keys" element={<ApiKeysPage />} />
                   <Route path="/logs" element={<LogsPage />} />
                   <Route path="/settings" element={<SettingsPage />} />
+                  <Route path="/prompt-templates" element={<Navigate to="/services/prompts" replace />} />
                   <Route path="/services" element={<KnowledgeBasePage />} />
                   <Route path="/services/knowledge-base" element={<KnowledgeBasePage />} />
                   <Route path="/services/mcp" element={<KnowledgeBasePage />} />
                   <Route path="/services/wiki" element={<KnowledgeBasePage />} />
                   <Route path="/services/skills" element={<KnowledgeBasePage />} />
+                  <Route path="/services/prompts" element={<KnowledgeBasePage />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Layout>

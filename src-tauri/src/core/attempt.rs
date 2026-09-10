@@ -647,6 +647,7 @@ mod tests {
             disabled: 0,
             priority,
             weight: 1,
+            sort_order: 0,
             quota_json: None,
             model_states_json: json!({
                 "version": 1,

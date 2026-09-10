@@ -147,6 +147,8 @@ export const authApi = {
   toggle: (id: string, disabled: boolean) => invoke<AuthAccount>("auth_toggle", { id, disabled }),
   quotaStatus: (id: string) => invoke<AuthQuotaStatus>("auth_quota_status", { id }),
   update: (input: AuthUpdateInput) => invoke<AuthAccount>("auth_update", { input }),
+  /** 手动拖拽排序：按传入顺序重写 sort_order。 */
+  reorder: (orderedIds: string[]) => invoke<void>("auth_reorder_accounts", { orderedIds }),
 };
 
 // Stats commands

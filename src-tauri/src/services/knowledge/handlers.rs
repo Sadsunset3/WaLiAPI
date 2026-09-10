@@ -13,8 +13,6 @@ use axum::{
 };
 use serde::Deserialize;
 use sha2::Digest;
-use tauri::Manager;
-
 #[derive(Deserialize)]
 pub struct ListQuery {
     #[serde(default)]

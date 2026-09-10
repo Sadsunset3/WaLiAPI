@@ -212,6 +212,9 @@ pub struct ApiKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateApiKeyInput {
     pub name: String,
+    /// 可选自定义密钥。留空则自动生成 sk-waliapi-<uuid>。
+    #[serde(default)]
+    pub key: Option<String>,
     pub allowed_models: Option<Vec<String>>,
     pub allowed_channels: Option<Vec<String>>,
     pub denied_models: Option<Vec<String>>,
@@ -301,6 +304,9 @@ pub struct AuthAccount {
     pub disabled: i64,
     pub priority: i64,
     pub weight: i64,
+    /// 手动排序权重（拖拽排序），默认 0 表示未手动排序。
+    #[sqlx(default)]
+    pub sort_order: i64,
     pub quota_json: Option<String>,
     pub model_states_json: String,
     pub model_mapping_json: String,

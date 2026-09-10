@@ -14,7 +14,6 @@ const LogsPage = lazy(() => import("./pages/LogsPage").then(module => ({ default
 const SettingsPage = lazy(() => import("./pages/SettingsPage").then(module => ({ default: module.SettingsPage })));
 const UsagePage = lazy(() => import("./pages/UsagePage").then(module => ({ default: module.UsagePage })));
 const KnowledgeBasePage = lazy(() => import("./pages/KnowledgeBasePage").then(module => ({ default: module.KnowledgeBasePage })));
-const PromptTemplatesPage = lazy(() => import("./pages/PromptTemplatesPage"));
 const UpdateChecker = lazy(() => import("./components/UpdateChecker").then(module => ({ default: module.UpdateChecker })));
 
 function App() {
@@ -59,12 +58,13 @@ function App() {
             <Route path="/api-keys" element={<ApiKeysPage />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
-            <Route path="/prompt-templates" element={<PromptTemplatesPage />} />
+            <Route path="/prompt-templates" element={<Navigate to="/services/prompts" replace />} />
             <Route path="/services" element={<KnowledgeBasePage />} />
             <Route path="/services/knowledge-base" element={<KnowledgeBasePage />} />
             <Route path="/services/mcp" element={<KnowledgeBasePage />} />
             <Route path="/services/wiki" element={<KnowledgeBasePage />} />
             <Route path="/services/skills" element={<KnowledgeBasePage />} />
+            <Route path="/services/prompts" element={<KnowledgeBasePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
           </Suspense>

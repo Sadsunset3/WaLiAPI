@@ -1095,6 +1095,27 @@ pub async fn auth_update(
     )
 }
 
+/// 手动拖拽排序：按传入顺序重写 sort_order（首元素最大）。
+#[tauri::command]
+pub async fn auth_reorder_accounts(
+    ordered_ids: Vec<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    auth_reorder_accounts_impl(&ordered_ids, &*state).await
+}
+
+pub async fn auth_reorder_accounts_impl(
+    ordered_ids: &[String],
+    state: &Arc<AppState>,
+) -> Result<(), String> {
+    let repository = Repository::new(state.db.pool.clone());
+    repository
+        .reorder_auth_accounts(ordered_ids)
+        .await
+        .map_err(|_| storage_error())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1111,7 +1132,7 @@ mod tests {
         crate::db::models::AuthAccount {
             id: "account-1".into(), provider: "codex".into(), label: "Codex".into(),
             account_id: "provider-account-1".into(), status: "active".into(), disabled: 0,
-            priority: 0, weight: 1, quota_json: None,
+            priority: 0, weight: 1, sort_order: 0, quota_json: None,
             model_states_json: json!({"version":1,"models":[]}).to_string(),
             attributes_json: json!({"email":"person@example.test","plan_type":"plus","ignored":"secret"}).to_string(),
             model_mapping_json: "{}".to_string(),

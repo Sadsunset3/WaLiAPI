@@ -747,7 +747,7 @@ fn build_page(path: &str, raw_content: &str, source_filename: &str) -> Generated
     }
 }
 
-fn build_page_from_content(content: &str, source_filename: &str) -> Option<GeneratedPage> {
+fn build_page_from_content(content: &str, _source_filename: &str) -> Option<GeneratedPage> {
     let title = extract_title_from_content(content, "");
     if title.is_empty() {
         return None;

@@ -327,6 +327,7 @@ pub fn run() {
             commands::auth::auth_toggle,
             commands::auth::auth_quota_status,
             commands::auth::auth_update,
+            commands::auth::auth_reorder_accounts,
             commands::log::get_logs,
             commands::log::count_logs,
             commands::log::get_log,

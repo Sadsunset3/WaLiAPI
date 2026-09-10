@@ -61,6 +61,7 @@ fn account(id: &str, priority: i64, models: ModelStates) -> AuthAccount {
         disabled: 0,
         priority,
         weight: 1,
+        sort_order: 0,
         quota_json: None,
         model_states_json: serde_json::to_string(&models).unwrap(),
         model_mapping_json: "{}".into(),

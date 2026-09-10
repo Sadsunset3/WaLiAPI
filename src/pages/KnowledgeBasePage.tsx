@@ -75,12 +75,14 @@ import {
   Inbox,
 } from "lucide-react";
 
-type ServiceTab = "knowledge" | "wiki" | "mcp" | "skills";
+import { PromptTemplatesSection } from "../components/PromptTemplatesSection";
+
+type ServiceTab = "knowledge" | "wiki" | "mcp" | "skills" | "prompts";
 type KbTab = "documents" | "sources" | "search" | "ask" | "settings" | "index" | "mcp";
 
 export function KnowledgeBasePage() {
   const location = useLocation();
-  const initialTab: ServiceTab = location.pathname.includes("/mcp") ? "mcp" : location.pathname.includes("/skills") ? "skills" : location.pathname.includes("/wiki") ? "wiki" : "knowledge";
+  const initialTab: ServiceTab = location.pathname.includes("/mcp") ? "mcp" : location.pathname.includes("/skills") ? "skills" : location.pathname.includes("/prompts") ? "prompts" : location.pathname.includes("/wiki") ? "wiki" : "knowledge";
   const [serviceTab, setServiceTab] = useState<ServiceTab>(initialTab);
 
   const serviceTabs: { key: ServiceTab; label: string; icon: typeof BookOpen }[] = [
@@ -88,6 +90,7 @@ export function KnowledgeBasePage() {
     { key: "wiki", label: "Wiki", icon: Network },
     { key: "mcp", label: "MCP", icon: Terminal },
     { key: "skills", label: "Skills", icon: Puzzle },
+    { key: "prompts", label: "Prompt 模板", icon: FileText },
   ];
 
   return (
@@ -96,7 +99,7 @@ export function KnowledgeBasePage() {
       <div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 bg-white/90 px-7 py-5 backdrop-blur-md border-b border-slate-100">
         <div>
           <h1 className="page-title">服务</h1>
-          <p className="page-subtitle">本地 RAG 知识库 · Wiki 知识图谱 · 文档向量化 + HNSW 索引 · RAG 问答 · 支持 AI Agent 对接</p>
+          <p className="page-subtitle">本地 RAG 知识库 · Wiki 知识图谱 · MCP · Prompt 模板 · 支持 AI Agent 对接</p>
         </div>
         <div className="flex items-center gap-2">
           {serviceTabs.map(({ key, label, icon: Icon }) => (
@@ -117,7 +120,7 @@ export function KnowledgeBasePage() {
       </div>
 
       <div>
-        {serviceTab === "knowledge" ? <KnowledgeBaseSection /> : serviceTab === "wiki" ? <WikiSection /> : serviceTab === "mcp" ? <McpSection /> : <SkillsSection />}
+        {serviceTab === "knowledge" ? <KnowledgeBaseSection /> : serviceTab === "wiki" ? <WikiSection /> : serviceTab === "mcp" ? <McpSection /> : serviceTab === "prompts" ? <PromptTemplatesSection /> : <SkillsSection />}
       </div>
     </div>
   );

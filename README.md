@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.3.1-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-使用方式)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -52,7 +52,7 @@
 | 🐛 | **cyd** | [@cydmacro](https://github.com/cydmacro) | 2 | `+105 / -9` | Codex 工具调用参数一次性下发，修复部分客户端截断 · Codex Responses 请求 strip `prompt_cache_options` 兼容修复（PR #59）|
 | 🔧 | **cham** | [@Cham1229](https://github.com/Cham1229) | 1 | `+444 / -111` | 自定义安全规则接入运行时安全扫描管道——规则加载·白名单短路·黑名单匹配·端到端集成测试（PR #64）|
 | 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
-| 🐛 | **zjx** | `—` | 1 | `+22 / -7` | Usage 连接测试请求头改为非中文占位密钥，避免无效请求头写入 |
+| 🐛 | **zjx** | [@Sadsunset3](https://github.com/Sadsunset3) | 6 | `+549 / -111` | Anthropic 容量错误提交前识别与跨协议故障切换 · sub2api 导入缺 account id 回退 chatgpt_user_id · 导入账号数即时刷新 · 账号操作后滚动位置保持 · Usage 连接测试请求头非中文占位修复 |
 | 🐛 | **breezewonders** | [@breezewonders-dev](https://github.com/breezewonders-dev) | 1 | `+14 / -0` | Chat-to-Responses 转换 store 字段归一化修复 |
 
 </div>
@@ -654,6 +654,40 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 ---
 
 ## 📌 版本历史
+
+### v0.3.1 (2026-09-10)
+
+#### 渠道与配额
+
+- ✨ **渠道主动健康探测**：后台周期性探测上游可用性，异常渠道在候选排序中自动沉底，恢复后自动回归；探测流量与业务统计口径隔离（迁移 033，PR #102）
+- ✨ **配额记账强化**：两轨配额记账口径合一并递增封顶；配额 429 错误体按端点协议返回并携带 `used/limit` 字段（PR #92）
+
+#### 流式与可观测性
+
+- ✨ **流式内容段持久化**：SSE 流式生成内容逐段落库，连接中断后已生成内容仍可查看（迁移 032，PR #95）
+- ✨ **Responses 断线续传回放**：Responses 协议支持逐帧持久化 + offset 回放 + incomplete 收尾，客户端断线后可从中断点续传
+- ✨ **数据面 X-Request-Id 标准化**：统一采纳/生成/回显请求 ID 并落库 trace_id，链路追踪闭环（PR #94）
+- ✨ **OTLP/HTTP JSON 导出器**：request_log 增量导出为 OTLP span，可对接外部可观测平台（PR #94）
+
+#### 知识库
+
+- ✨ **文档级增量索引**：chunk 内容哈希比对 + 未变块 embedding 复用 + HNSW 单点插入与墓碑摘除，文档更新只重算变更部分（PR #93）
+- ✨ **多轮对话查询改写**：指代型问题在检索前先做查询改写，提升多轮 RAG 命中率（默认关，`kb.query_rewrite` 开关）
+- ✨ **混合检索增强**：RRF 融合默认开启，可选 LLM listwise 重排进一步提升召回质量
+- ✨ **Prompt 模板版本化**：模板支持版本管理页与种子兼容硬保证（迁移 034）
+
+#### 语义缓存
+
+- ✨ **语义缓存 exact+semantic 两层**：精确命中 + 向量语义命中两级缓存，默认关闭；清空逻辑下沉 `semantic_cache::clear` 并补按模型/全清测试（迁移 035）
+
+#### Auth 账号
+
+- ✨ **Codex 设备码登录**：支持 Device Authorization 流程（`codex login --device-auth`），并处理 pending 授权状态轮询（PR #77）
+- ✨ **Auth 账号列表视图**：Auth 渠道页新增账号列表视图，多账号一目了然（PR #103）
+
+#### 修复
+
+- 🐛 **Anthropic 容量错误提交前识别**：容量/过载类错误在响应提交前检测并触发跨协议故障切换，避免错误透传给下游（PR #101）
 
 ### v0.3.0 (2026-09-09)
 

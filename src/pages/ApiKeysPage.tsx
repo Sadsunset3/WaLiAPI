@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo } from "react";
 import { apiKeyApi, channelApi, authApi } from "../lib/api";
 import type { ApiKey, CreateApiKeyInput, ApiKeyStats, Channel, AuthAccount } from "../types";
 import { formatTime } from "../lib/constants";
-import { Plus, Key, Trash2, Power, X, Check, Copy, CalendarClock, Database, Activity, Clock, Zap, ChevronDown, Pencil } from "lucide-react";
+import { Plus, Key, Trash2, Power, X, Check, Copy, CalendarClock, Database, Activity, Clock, Zap, ChevronDown, ChevronRight, Pencil, AlertTriangle } from "lucide-react";
 import { writeClipboard } from "../lib/runtime";
 
 function formatNumber(n: number): string {
@@ -317,6 +317,8 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
   const initialRules = rulesFromKey(editKey);
   const [whitelistRules, setWhitelistRules] = useState<Rule[]>(initialRules.wl);
   const [blacklistRules, setBlacklistRules] = useState<Rule[]>(initialRules.bl);
+  const [customKeyOpen, setCustomKeyOpen] = useState(false);
+  const [customKey, setCustomKey] = useState("");
 
   useEffect(() => {
     Promise.all([
@@ -394,9 +396,11 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
       });
     } else {
       // Create mode: only pass non-empty arrays.
+      const trimmedCustomKey = customKey.trim();
       const input: CreateApiKeyInput = {
         name: trimmedName,
         quota_limit: quotaLimit,
+        ...(trimmedCustomKey ? { key: trimmedCustomKey } : {}),
         ...(wlChannels.length ? { allowed_channels: wlChannels } : {}),
         ...(wlModels.length ? { allowed_models: wlModels } : {}),
         ...(blChannels.length ? { denied_channels: blChannels } : {}),
@@ -654,6 +658,55 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
               <input type="number" value={quotaLimit} onChange={e => setQuotaLimit(parseInt(e.target.value) || -1)} className="w-full rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm" />
             </div>
           </div>
+
+          {/* 自定义密钥（可折叠） */}
+          {!isEdit && (
+            <div className="rounded-2xl border border-border/60 bg-muted/20 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setCustomKeyOpen(!customKeyOpen)}
+                className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <span className="flex items-center gap-2">
+                  <Key size={14} />
+                  自定义密钥
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-normal">可选</span>
+                </span>
+                {customKeyOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              </button>
+              {customKeyOpen && (
+                <div className="border-t border-border/60 px-4 py-4 space-y-3">
+                  <div className="flex items-start gap-2 rounded-xl bg-amber-50/80 px-3 py-2.5 text-xs text-amber-700">
+                    <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                    <div className="space-y-1">
+                      <p className="font-medium">一般无需自定义密钥</p>
+                      <p className="text-amber-600/90 leading-relaxed">
+                        系统会自动生成高强度的随机密钥，安全性更好。自定义密钥适用于：
+                      </p>
+                      <ul className="list-disc pl-4 text-amber-600/90 space-y-0.5">
+                        <li>从其他网关/服务迁移，需保持密钥不变</li>
+                        <li>对接已有固定密钥的第三方系统</li>
+                        <li>测试或演示环境需要固定密钥</li>
+                      </ul>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="mb-1.5 block text-xs font-medium text-muted-foreground">密钥内容</label>
+                    <input
+                      value={customKey}
+                      onChange={e => setCustomKey(e.target.value)}
+                      className="w-full rounded-xl border border-border bg-background/70 px-3 py-2.5 text-sm font-mono"
+                      placeholder="sk-waliapi-xxxxxxxxxxxx"
+                      maxLength={128}
+                    />
+                    <p className="mt-1.5 text-[11px] text-muted-foreground">
+                      仅支持字母、数字、连字符 (-) 和下划线 (_)，长度 8-128 位。
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* 限制配置区 */}
           <div>

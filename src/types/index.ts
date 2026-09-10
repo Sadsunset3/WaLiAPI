@@ -135,6 +135,8 @@ export interface ApiKey {
 
 export interface CreateApiKeyInput {
   name: string;
+  /** 可选自定义密钥。留空则自动生成 sk-waliapi-<uuid>。 */
+  key?: string;
   allowed_models?: string[];
   allowed_channels?: string[];
   denied_models?: string[];
@@ -247,6 +249,8 @@ export interface AuthAccount {
   disabled: boolean;
   priority: number;
   weight: number;
+  /** 手动排序权重（拖拽排序），默认 0 表示未手动排序。 */
+  sort_order: number;
   email: string | null;
   plan_type: string | null;
   /** Stable, non-secret reason the account was marked invalid (e.g. "payment_required"). */

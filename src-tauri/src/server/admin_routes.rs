@@ -618,6 +618,9 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             to_json(commands::auth::auth_quota_status(arg(&args, "id")?, state).await)
         }
         "auth_update" => to_json(commands::auth::auth_update(arg(&args, "input")?, state).await),
+        "auth_reorder_accounts" => {
+            to_json(commands::auth::auth_reorder_accounts(arg(&args, "orderedIds")?, state).await)
+        }
 
         // ── 仪表盘 / 设置 / 服务状态 ──
         "get_dashboard_stats" => to_json(commands::stats::get_dashboard_stats(state).await),

@@ -744,7 +744,44 @@ impl Repository {
     pub async fn create_api_key(&self, input: &CreateApiKeyInput) -> Result<ApiKey, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
-        let key = format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple());
+        let key = match &input.key {
+            Some(custom) => {
+                let trimmed = custom.trim();
+                if trimmed.is_empty() {
+                    format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple())
+                } else {
+                    // 校验格式：只允许字母、数字、连字符、下划线
+                    if !trimmed
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    {
+                        return Err(sqlx::Error::Protocol(
+                            "密钥只能包含字母、数字、连字符和下划线".to_string(),
+                        ));
+                    }
+                    // 校验长度
+                    if trimmed.len() < 8 || trimmed.len() > 128 {
+                        return Err(sqlx::Error::Protocol(
+                            "密钥长度需在 8-128 个字符之间".to_string(),
+                        ));
+                    }
+                    // 校验唯一性
+                    let exists: Option<(String,)> = sqlx::query_as(
+                        "SELECT id FROM api_keys WHERE key = ?",
+                    )
+                    .bind(trimmed)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                    if exists.is_some() {
+                        return Err(sqlx::Error::Protocol(
+                            "该密钥已存在，请更换后重试".to_string(),
+                        ));
+                    }
+                    trimmed.to_string()
+                }
+            }
+            None => format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple()),
+        };
         let allowed_models =
             serde_json::to_string(&input.allowed_models.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
@@ -908,11 +945,29 @@ impl Repository {
     // ==================== Auth Account ====================
 
     pub async fn list_auth_accounts(&self) -> Result<Vec<AuthAccount>, sqlx::Error> {
+        // sort_order 越大越靠前（手动拖拽排序）；同值时按创建时间倒序（新账号在前）。
         sqlx::query_as::<_, AuthAccount>(
-            "SELECT * FROM auth_accounts ORDER BY created_at DESC, id DESC",
+            "SELECT * FROM auth_accounts ORDER BY sort_order DESC, created_at DESC, id DESC",
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// 手动拖拽排序：按传入顺序重写 sort_order（倒序赋值，首元素最大）。
+    pub async fn reorder_auth_accounts(&self, ordered_ids: &[String]) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let mut tx = self.pool.begin().await?;
+        for (i, id) in ordered_ids.iter().enumerate() {
+            let sort_order = (ordered_ids.len() - i) as i64;
+            sqlx::query("UPDATE auth_accounts SET sort_order = ?, updated_at = ? WHERE id = ?")
+                .bind(sort_order)
+                .bind(&now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn get_auth_account(&self, id: &str) -> Result<AuthAccount, sqlx::Error> {

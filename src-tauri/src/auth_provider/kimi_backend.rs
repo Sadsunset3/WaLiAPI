@@ -382,6 +382,7 @@ mod tests {
             disabled: 0,
             priority: 0,
             weight: 1,
+            sort_order: 0,
             quota_json: None,
             model_states_json: "{}".into(),
             model_mapping_json: "{}".into(),
